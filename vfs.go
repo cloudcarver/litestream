@@ -598,22 +598,25 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos             ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1        ltx.TXID // Last TXID read from level 1
-	index           map[uint32]ltx.PageIndexElem
-	pending         map[uint32]ltx.PageIndexElem
-	pendingReplace  bool
-	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
-	targetTime      *time.Time                 // Target view time; nil means latest
-	latestLTXTime   time.Time                  // Timestamp of most recent LTX file
-	lastPollSuccess time.Time                  // Time of last successful poll
-	lockType        sqlite3vfs.LockType        // Current lock state
-	pageSize        uint32
-	commit          uint32
+	pos              ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1         ltx.TXID // Last TXID read from level 1
+	index            map[uint32]ltx.PageIndexElem
+	pending          map[uint32]ltx.PageIndexElem
+	pendingReplace   bool
+	pendingCommit    uint32 // Size belonging to the pending reader snapshot.
+	pendingCommitSet bool
+	cache            *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime       *time.Time                 // Target view time; nil means latest
+	latestLTXTime    time.Time                  // Timestamp of most recent LTX file
+	lastPollSuccess  time.Time                  // Time of last successful poll
+	lockType         sqlite3vfs.LockType        // Current lock state
+	pageSize         uint32
+	commit           uint32
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
 	dirty         map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
+	sizeDirty     bool             // An unsynced truncate, even with no dirty pages.
 	pendingTXID   ltx.TXID         // Next TXID to use for sync
 	expectedTXID  ltx.TXID         // Expected remote TXID (for conflict detection)
 	bufferFile    *os.File         // Temp file for durability
@@ -1283,7 +1286,7 @@ func (f *VFSFile) ResetTime(ctx context.Context) error {
 
 // rebuildIndex constructs a fresh page index and swaps it into the VFSFile.
 func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, target *time.Time) error {
-	index, err := f.buildIndexMap(ctx, infos)
+	index, commit, err := f.buildIndexMap(ctx, infos)
 	if err != nil {
 		return err
 	}
@@ -1302,8 +1305,10 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.index = index
+	f.commit = commit
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+	f.pendingCommitSet = false
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
 	if len(infos) > 0 {
@@ -1333,7 +1338,7 @@ func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
 }
 
 // buildIndexMap constructs a lookup of pgno to LTX file offsets.
-func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
+func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, uint32, error) {
 	index := make(map[uint32]ltx.PageIndexElem)
 	var commit uint32
 	for _, info := range infos {
@@ -1342,7 +1347,7 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 		// Read page index.
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return nil, fmt.Errorf("fetch page index: %w", err)
+			return nil, 0, fmt.Errorf("fetch page index: %w", err)
 		}
 
 		// Replace pages in overall index with new pages.
@@ -1352,16 +1357,18 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return nil, fmt.Errorf("fetch header: %w", err)
+			return nil, 0, fmt.Errorf("fetch header: %w", err)
+		}
+		if hdr.Commit < commit {
+			for pgno := range index {
+				if pgno > hdr.Commit {
+					delete(index, pgno)
+				}
+			}
 		}
 		commit = hdr.Commit
 	}
-
-	f.mu.Lock()
-	f.commit = commit
-	f.mu.Unlock()
-
-	return index, nil
+	return index, commit, nil
 }
 
 // buildIndex constructs a lookup of pgno to LTX file offsets (legacy wrapper).
@@ -1470,7 +1477,7 @@ func (f *VFSFile) Close() error {
 
 	// Final sync of dirty pages before closing
 	f.mu.Lock()
-	if f.writeEnabled && len(f.dirty) > 0 {
+	if f.writeEnabled && f.hasDirtyWrites() {
 		if err := f.syncToRemoteWithLock(); err != nil {
 			f.logger.Error("failed to sync on close", "error", err)
 		}
@@ -1667,23 +1674,20 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	} else {
 		// Page is not dirty - read from cache/remote
 		if err := f.readPageForWrite(pgno, page); err != nil {
-			// If page doesn't exist, use zero-filled page
-			f.logger.Debug("page not found, using empty page", "pgno", pgno)
+			return 0, fmt.Errorf("read page for write: %w", err)
 		}
 	}
 
 	// Apply write to page
 	n = copy(page[pageOffset:], b)
 
-	// Update commit count if this extends the database
-	if pgno > f.commit {
-		f.commit = pgno
-	}
-
 	// Write to buffer for durability (this updates f.dirty with the offset)
 	if err := f.writeToBuffer(pgno, page); err != nil {
 		f.logger.Error("failed to write to buffer", "error", err)
 		return 0, fmt.Errorf("write to buffer: %w", err)
+	}
+	if pgno > f.commit {
+		f.commit = pgno
 	}
 
 	f.logger.Debug("wrote to dirty page", "pgno", pgno, "offset", pageOffset, "len", n, "commit", f.commit)
@@ -1704,7 +1708,9 @@ func (f *VFSFile) readPageForWrite(pgno uint32, buf []byte) error {
 	// Get page index element
 	elem, ok := f.index[pgno]
 	if !ok {
-		return fmt.Errorf("page not found: %d", pgno)
+		// New pages (including holes below a previously extended EOF) have no
+		// remote version. Actual remote read failures below must propagate.
+		return nil
 	}
 
 	// Fetch from remote
@@ -1746,7 +1752,19 @@ func (f *VFSFile) Truncate(size int64) error {
 			delete(f.dirty, pgno)
 		}
 	}
+	for pgno := range f.index {
+		if pgno > newCommit {
+			delete(f.index, pgno)
+			f.cache.Remove(pgno)
+		}
+	}
+	for pgno := range f.pending {
+		if pgno > newCommit {
+			delete(f.pending, pgno)
+		}
+	}
 
+	f.sizeDirty = f.sizeDirty || f.commit != newCommit
 	f.commit = newCommit
 	f.logger.Debug("truncated", "newCommit", newCommit)
 
@@ -1773,7 +1791,7 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 	}
 
 	// Skip sync if no dirty pages
-	if len(f.dirty) == 0 {
+	if !f.hasDirtyWrites() {
 		return nil
 	}
 	// Skip sync during active transaction
@@ -1866,7 +1884,7 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 		close(waitDone) // Stop the watcher goroutine
 
 		// Sync dirty pages if any exist
-		if len(f.dirty) > 0 {
+		if f.hasDirtyWrites() {
 			if err := f.syncToRemoteWithLock(); err != nil {
 				f.disabling = false
 				f.cond.Broadcast() // Wake any waiting Lock() calls
@@ -1992,7 +2010,7 @@ func (f *VFSFile) syncToRemote() error {
 // Caller must hold f.mu.
 func (f *VFSFile) syncToRemoteWithLock() error {
 	// Double-check dirty pages exist
-	if len(f.dirty) == 0 {
+	if !f.hasDirtyWrites() {
 		return nil
 	}
 
@@ -2004,12 +2022,30 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	}
 
 	// Create LTX file from dirty pages
-	ltxReader := f.createLTXFromDirty()
+	ltxReader, encoded := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
 	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
+	// Always stop and join the encoder, including an upload that fails before
+	// reading the pipe. The buffer must not be reused while it is still read.
+	_ = ltxReader.CloseWithError(err)
+	result := <-encoded
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
+	}
+	if result.err != nil {
+		return fmt.Errorf("encode LTX: %w", result.err)
+	}
+
+	// Publish the exact offsets produced by the local encoder before dropping
+	// dirty pages. Cache eviction must never expose an older remote page.
+	for pgno, elem := range result.index {
+		f.index[pgno] = elem
+		if f.pendingReplace {
+			f.pending[pgno] = elem
+		} else {
+			delete(f.pending, pgno)
+		}
 	}
 
 	f.logger.Info("synced to remote",
@@ -2029,7 +2065,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		f.vfs.writeMu.Unlock()
 	}
 
-	// Update cache with synced pages (index will be populated naturally when pages are fetched)
+	// Warm the cache with synced pages; correctness no longer depends on it.
 	for pgno, bufferOff := range f.dirty {
 		cachedData := make([]byte, f.pageSize)
 		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
@@ -2049,6 +2085,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	// Clear dirty pages
 	f.dirty = make(map[uint32]int64)
+	f.sizeDirty = false
 
 	// Clear write buffer after successful sync
 	if err := f.clearWriteBuffer(); err != nil {
@@ -2092,12 +2129,20 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 	return nil
 }
 
-// createLTXFromDirty creates an LTX file from dirty pages.
-// Returns a streaming reader for the LTX data using io.Pipe to avoid loading
-// all data into memory at once.
-// Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() io.Reader {
+type vfsEncodedLTX struct {
+	index map[uint32]ltx.PageIndexElem
+	err   error
+}
+
+// hasDirtyWrites requires f.mu.
+func (f *VFSFile) hasDirtyWrites() bool { return len(f.dirty) > 0 || f.sizeDirty }
+
+// createLTXFromDirty streams the dirty pages and reports their encoded offsets.
+// The caller must hold f.mu, close the reader, and wait for the result before
+// modifying/reusing the buffer, even if the upload fails without reading it.
+func (f *VFSFile) createLTXFromDirty() (*io.PipeReader, <-chan vfsEncodedLTX) {
 	pr, pw := io.Pipe()
+	done := make(chan vfsEncodedLTX, 1)
 
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
@@ -2120,8 +2165,10 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 
 	go func() {
 		var err error
+		index := make(map[uint32]ltx.PageIndexElem, len(pgnos))
 		defer func() {
-			pw.CloseWithError(err)
+			_ = pw.CloseWithError(err)
+			done <- vfsEncodedLTX{index: index, err: err}
 		}()
 
 		enc, encErr := ltx.NewEncoder(pw)
@@ -2159,10 +2206,12 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 				return
 			}
 
+			offset := enc.N()
 			if err = enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 				err = fmt.Errorf("encode page %d: %w", pgno, err)
 				return
 			}
+			index[pgno] = ltx.PageIndexElem{Level: 0, MinTXID: pendingTXID, MaxTXID: pendingTXID, Offset: offset, Size: enc.N() - offset}
 		}
 
 		// Close encoder (writes trailer and page index)
@@ -2172,7 +2221,7 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 		}
 	}()
 
-	return pr
+	return pr, done
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
@@ -2250,22 +2299,9 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 	}
 
 	f.mu.Lock()
-	for pgno := range f.index {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
-	for pgno := range f.pending {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
-	// Include dirty pages in size calculation
-	for pgno := range f.dirty {
-		if v := int64(pgno) * int64(pageSize); v > size {
-			size = v
-		}
-	}
+	// commit tracks the visible file size, including unsynced writes/truncates.
+	// An LTX index is sparse and pending entries belong to a future snapshot.
+	size = int64(f.commit) * int64(pageSize)
 	f.mu.Unlock()
 
 	f.logger.Debug("file size", "size", size)
@@ -2306,7 +2342,7 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 				return sqlite3vfs.BusyError
 			}
 			f.vfs.writeFile = f
-			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
+			if f.vfs.lastSyncedTXID > f.expectedTXID && !f.hasDirtyWrites() {
 				f.expectedTXID = f.vfs.lastSyncedTXID
 				f.pendingTXID = f.vfs.lastSyncedTXID + 1
 				f.pos = ltx.Pos{TXID: f.expectedTXID}
@@ -2346,6 +2382,16 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 
 	f.lockType = elock
 
+	if elock != sqlite3vfs.LockNone {
+		return nil
+	}
+
+	// Pending updates were intentionally not written into the hydrated file
+	// while this reader held its snapshot. Fall back to indexed reads now.
+	if f.hydrator != nil && (len(f.pending) > 0 || f.pendingCommitSet) {
+		f.hydrator.Disable()
+	}
+
 	// Copy pending index to main index and invalidate affected pages in cache.
 	if f.pendingReplace {
 		// Replace entire index
@@ -2357,14 +2403,15 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	} else if len(f.pending) > 0 {
 		// Merge pending into index
 		count := len(f.pending)
-		for k, v := range f.pending {
-			f.index[k] = v
-			f.cache.Remove(k)
-		}
+		f.mergeIndexEntries(f.index, f.pending, true)
 		f.logger.Debug("cache invalidated pages", "count", count)
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+	if f.pendingCommitSet && !f.hasDirtyWrites() {
+		f.commit = f.pendingCommit
+	}
+	f.pendingCommitSet = false
 
 	return nil
 }
@@ -2588,187 +2635,204 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 	}
 }
 
-// pollReplicaClient fetches new LTX files from the replica client and updates
-// the page index & the current position.
+// vfsTruncation invalidates older page versions past a committed file size.
+// Keeping the TXID matters when a poll also includes a later re-extension.
+type vfsTruncation struct {
+	txid   ltx.TXID
+	commit uint32
+}
+
+// pollReplicaClient fetches metadata without holding f.mu, then atomically
+// installs it only if the local writer/snapshot has not moved in the meantime.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
-	pos := f.Pos()
-	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
-
-	combined := make(map[uint32]ltx.PageIndexElem)
-
 	f.mu.Lock()
+	if f.targetTime != nil || (f.writeEnabled && (f.inTransaction || f.hasDirtyWrites())) {
+		f.mu.Unlock()
+		return nil
+	}
+	pos, maxTXID1Snapshot := f.pos, f.maxTXID1
 	baseCommit := f.commit
-	maxTXID1Snapshot := f.maxTXID1
+	if f.pendingCommitSet {
+		baseCommit = f.pendingCommit
+	}
 	f.mu.Unlock()
 
-	newCommit := baseCommit
-	replaceIndex := false
-
-	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
+	maxTXID0, idx0, commit0, trunc0, err := f.pollLevel(ctx, 0, pos.TXID, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
-	if replace0 {
-		replaceIndex = true
-		baseCommit = commit0
-		newCommit = commit0
-		combined = idx0
-	} else {
-		if len(idx0) > 0 {
-			baseCommit = commit0
-		}
-		for k, v := range idx0 {
-			combined[k] = v
-		}
-		if commit0 > newCommit {
-			newCommit = commit0
-		}
-	}
-
-	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
+	maxTXID1, idx1, commit1, trunc1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
-	if replace1 {
-		replaceIndex = true
-		baseCommit = commit1
-		newCommit = commit1
-		combined = idx1
-	} else {
-		for k, v := range idx1 {
-			combined[k] = v
+
+	maxTXID, newCommit := maxTXID0, commit0
+	if maxTXID1 > maxTXID {
+		maxTXID, newCommit = maxTXID1, commit1
+	}
+	combined := idx0
+	for pgno, elem := range idx1 {
+		if prev, ok := combined[pgno]; !ok || elem.MaxTXID >= prev.MaxTXID {
+			combined[pgno] = elem
 		}
-		if commit1 > newCommit {
-			newCommit = commit1
+	}
+	truncations := append(trunc0, trunc1...)
+	for pgno, elem := range combined {
+		for _, trunc := range truncations {
+			if pgno > trunc.commit && elem.MaxTXID <= trunc.txid {
+				delete(combined, pgno)
+				break
+			}
 		}
 	}
 
-	// Send updates to a pending list if there are active readers.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	if f.targetTime != nil {
-		// Skip applying updates while time travel is active to avoid
-		// overwriting the historical snapshot state.
-		return nil
+	if f.targetTime != nil || f.pos != pos || (f.writeEnabled && (f.inTransaction || f.hasDirtyWrites())) {
+		return nil // Retry from the new position on the next poll.
 	}
 
-	// Apply updates and invalidate cache entries for updated pages
-	invalidateN := 0
+	locked := f.lockType >= sqlite3vfs.LockShared
 	target := f.index
-	targetIsMain := true
-	if f.lockType >= sqlite3vfs.LockShared {
+	if locked {
 		target = f.pending
-		targetIsMain = false
-	} else {
-		f.pendingReplace = false
 	}
-	if replaceIndex {
-		if f.lockType < sqlite3vfs.LockShared {
-			f.index = make(map[uint32]ltx.PageIndexElem)
-			target = f.index
-			targetIsMain = true
-			f.pendingReplace = false
+	if len(truncations) > 0 && locked && !f.pendingReplace {
+		// A truncation needs a complete replacement snapshot, but must retain
+		// unchanged pages below the new EOF. Only truncations copy the index.
+		target = make(map[uint32]ltx.PageIndexElem, len(f.index)+len(f.pending))
+		for pgno, elem := range f.index {
+			target[pgno] = elem
+		}
+		for pgno, elem := range f.pending {
+			target[pgno] = elem
+		}
+		f.pending = target
+		f.pendingReplace = true
+	}
+	for _, trunc := range truncations {
+		for pgno, elem := range target {
+			if pgno > trunc.commit && elem.MaxTXID <= trunc.txid {
+				delete(target, pgno)
+				if !locked {
+					f.cache.Remove(pgno)
+				}
+			}
+		}
+	}
+
+	// Older compacted files may improve locations, never regress page versions.
+	// The commit comes from the newest transaction, not the largest page count.
+	visibleCommit := baseCommit
+	if maxTXID > pos.TXID {
+		visibleCommit = newCommit
+	}
+	for pgno := range combined {
+		if pgno > visibleCommit {
+			delete(combined, pgno)
+		}
+	}
+	f.mergeIndexEntries(target, combined, !locked)
+	if maxTXID > pos.TXID {
+		if locked {
+			f.pendingCommit, f.pendingCommitSet = newCommit, true
 		} else {
-			f.pending = make(map[uint32]ltx.PageIndexElem)
-			target = f.pending
-			targetIsMain = false
-			f.pendingReplace = true
+			f.commit = newCommit
+		}
+		f.pos.TXID = maxTXID
+	}
+	if maxTXID1 > f.maxTXID1 {
+		f.maxTXID1 = maxTXID1
+	}
+
+	// Hydration must follow the visible snapshot, not pending reader updates.
+	if !locked && f.hydrator != nil && f.hydrator.Complete() {
+		updates := make(map[uint32]ltx.PageIndexElem)
+		for pgno, elem := range combined {
+			if f.index[pgno] == elem {
+				updates[pgno] = elem
+			}
+		}
+		if err := f.hydrator.ApplyUpdates(ctx, updates); err != nil {
+			f.hydrator.Disable()
+			return fmt.Errorf("apply hydrated updates: %w", err)
 		}
 	}
-	for k, v := range combined {
-		target[k] = v
-		// Invalidate cache if we're updating the main index
-		if targetIsMain {
-			f.cache.Remove(k)
-			invalidateN++
-		}
-	}
-
-	if invalidateN > 0 {
-		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
-	}
-
-	if replaceIndex {
-		f.commit = newCommit
-	} else if len(combined) > 0 && newCommit > f.commit {
-		f.commit = newCommit
-	}
-
-	if maxTXID0 > maxTXID1 {
-		f.pos.TXID = maxTXID0
-	} else {
-		f.pos.TXID = maxTXID1
-	}
-
-	f.maxTXID1 = maxTXID1
-	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
-
-	// Apply updates to hydrated file if hydration is complete
-	if f.hydrator != nil && f.hydrator.Complete() && len(combined) > 0 {
-		if err := f.hydrator.ApplyUpdates(f.ctx, combined); err != nil {
-			f.logger.Error("failed to apply updates to hydrated file", "error", err)
-		}
-	}
-
 	return nil
 }
 
-// pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
-// any index updates, the latest commit value, and if the index should be replaced.
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
-	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
+// mergeIndexEntries requires f.mu. Equivalent compaction pointers do not evict
+// hot pages; older entries, including pending entries overtaken by sync, are ignored.
+func (f *VFSFile) mergeIndexEntries(target, updates map[uint32]ltx.PageIndexElem, invalidate bool) {
+	for pgno, elem := range updates {
+		prev, ok := target[pgno]
+		if !invalidate && !f.pendingReplace {
+			if current, exists := f.index[pgno]; exists && (!ok || current.MaxTXID > prev.MaxTXID) {
+				prev, ok = current, true
+			}
+		}
+		if ok && (elem.MaxTXID < prev.MaxTXID || (elem.MaxTXID == prev.MaxTXID && elem.Level <= prev.Level)) {
+			continue
+		}
+		target[pgno] = elem
+		if invalidate && (!ok || elem.MaxTXID > prev.MaxTXID) {
+			f.cache.Remove(pgno)
+		}
+	}
+}
+
+// pollLevel returns page locations plus size transitions newer than visibleTXID.
+// L1 discovery must include files straddling the watermark because ReplicaClient
+// seek is based on MinTXID, not MaxTXID.
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID, visibleTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, []vfsTruncation, error) {
+	seek := prevMaxTXID + 1
+	if level > 0 {
+		seek = 0
+	}
+	itr, err := f.client.LTXFiles(ctx, level, seek, false)
 	if err != nil {
-		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, baseCommit, nil, fmt.Errorf("ltx files: %w", err)
 	}
 	defer func() { _ = itr.Close() }()
 
 	index := make(map[uint32]ltx.PageIndexElem)
-	maxTXID := prevMaxTXID
-	lastCommit := baseCommit
-	newCommit := baseCommit
-	replaceIndex := false
-
+	maxTXID, newCommit := prevMaxTXID, baseCommit
+	var truncations []vfsTruncation
 	for itr.Next() {
 		info := itr.Item()
-
-		f.mu.Lock()
-		isNextTXID := info.MinTXID == maxTXID+1
-		f.mu.Unlock()
-		if !isNextTXID {
-			if level == 0 && info.MinTXID > maxTXID+1 {
+		if info.MaxTXID <= maxTXID {
+			continue
+		}
+		if info.MinTXID > maxTXID+1 {
+			if level == 0 {
 				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
 				break
 			}
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
+			return maxTXID, nil, newCommit, nil, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
-
-		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, newCommit, nil, fmt.Errorf("fetch page index: %w", err)
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
+			return maxTXID, nil, newCommit, nil, fmt.Errorf("fetch header: %w", err)
 		}
-
-		if hdr.Commit < lastCommit {
-			replaceIndex = true
-			index = make(map[uint32]ltx.PageIndexElem)
+		if info.MaxTXID > visibleTXID {
+			if hdr.Commit < newCommit {
+				truncations = append(truncations, vfsTruncation{txid: info.MaxTXID, commit: hdr.Commit})
+			}
+			newCommit = hdr.Commit
 		}
-		lastCommit = hdr.Commit
-		newCommit = hdr.Commit
-
-		for k, v := range idx {
-			f.logger.Debug("adding new page index", "page", k, "elem", v)
-			index[k] = v
+		for pgno, elem := range idx {
+			index[pgno] = elem
 		}
 		maxTXID = info.MaxTXID
 	}
-
-	return maxTXID, index, newCommit, replaceIndex, nil
+	if err := itr.Close(); err != nil {
+		return maxTXID, nil, newCommit, nil, fmt.Errorf("iterate ltx files: %w", err)
+	}
+	return maxTXID, index, newCommit, truncations, nil
 }
 
 func (f *VFSFile) pageSizeBytes() (uint32, error) {
