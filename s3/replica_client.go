@@ -1551,10 +1551,18 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 	}
 
 	// Create paginator for listing objects with level prefix
-	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, &s3.ListObjectsV2Input{
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(client.Bucket),
 		Prefix: aws.String(prefix),
-	})
+	}
+	if level == 0 && seek > 0 {
+		// seek is inclusive on MinTXID. A bare, fixed-width TXID sorts before
+		// every filename starting with that TXID (including ranged L0 files).
+		// Do not use the complete filename: StartAfter is exclusive. Higher
+		// levels retain their existing scan/overlap semantics.
+		input.StartAfter = aws.String(prefix + fmt.Sprintf("%016x", uint64(seek)))
+	}
+	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, input)
 
 	return itr
 }
@@ -1662,7 +1670,7 @@ func (itr *fileIterator) Next() bool {
 			itr.pageIndex = 0
 
 			// Log page contents for debugging.
-			if len(itr.page.Contents) > 0 {
+			if len(itr.page.Contents) > 0 && itr.client.logger.Enabled(itr.ctx, slog.LevelDebug) {
 				keys := make([]string, 0, len(itr.page.Contents))
 				for _, obj := range itr.page.Contents {
 					keys = append(keys, path.Base(aws.ToString(obj.Key)))

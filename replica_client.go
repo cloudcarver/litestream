@@ -163,5 +163,5 @@ func FetchPage(ctx context.Context, client ReplicaClient, level int, minTXID, ma
 	if err != nil {
 		return ltx.PageHeader{}, nil, fmt.Errorf("read ltx page frame: %w", err)
 	}
-	return ltx.DecodePageData(b)
+	return decodePageData(b)
 }

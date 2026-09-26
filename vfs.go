@@ -4,6 +4,8 @@
 package litestream
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -35,6 +37,11 @@ const (
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
+
+	// Small commits avoid a pipe and an extra upload buffer. Larger commits
+	// remain streamed, so a bulk write cannot retain an unbounded buffer.
+	vfsSmallLTXPageBytes = 64 * 1024
+	vfsLTXBufferLimit    = 128 * 1024
 )
 
 // ErrConflict is returned when the remote replica has newer transactions than expected.
@@ -60,6 +67,9 @@ type VFS struct {
 	// PollInterval is the interval at which to poll the replica client for new
 	// LTX files. The index will be fetched for the new files automatically.
 	PollInterval time.Duration
+	// MaxPollInterval enables bounded idle backoff when greater than PollInterval.
+	// Zero preserves fixed polling for existing read-replica users.
+	MaxPollInterval time.Duration
 
 	// CacheSize is the maximum size of the page cache in bytes.
 	CacheSize int
@@ -176,6 +186,7 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 
 	f := NewVFSFile(client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
+	f.MaxPollInterval = vfs.MaxPollInterval
 	f.CacheSize = vfs.CacheSize
 	f.vfs = vfs
 	f.perConnClient = perConnClient
@@ -609,6 +620,7 @@ type VFSFile struct {
 	targetTime       *time.Time                 // Target view time; nil means latest
 	latestLTXTime    time.Time                  // Timestamp of most recent LTX file
 	lastPollSuccess  time.Time                  // Time of last successful poll
+	pollWake         chan struct{}              // Local commits reset idle backoff.
 	lockType         sqlite3vfs.LockType        // Current lock state
 	pageSize         uint32
 	commit           uint32
@@ -622,6 +634,7 @@ type VFSFile struct {
 	bufferFile    *os.File         // Temp file for durability
 	bufferPath    string           // Path to buffer file
 	bufferNextOff int64            // Next write offset in buffer file
+	ltxBuffer     bytes.Buffer     // Bounded scratch space for small LTX uploads
 	syncTicker    *time.Ticker     // Ticker for periodic sync
 	syncInterval  time.Duration    // Interval for periodic sync
 	syncStop      chan struct{}    // Signal to stop sync loop
@@ -641,8 +654,9 @@ type VFSFile struct {
 
 	logger *slog.Logger
 
-	PollInterval time.Duration
-	CacheSize    int
+	PollInterval    time.Duration
+	MaxPollInterval time.Duration
+	CacheSize       int
 
 	// Compaction support (only used when VFS.CompactionEnabled is true)
 	vfs              *VFS       // Reference back to parent VFS for config
@@ -1046,6 +1060,7 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 		pending:      make(map[uint32]ltx.PageIndexElem),
 		logger:       logger,
 		PollInterval: DefaultPollInterval,
+		pollWake:     make(chan struct{}, 1),
 		CacheSize:    DefaultCacheSize,
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
@@ -1105,8 +1120,23 @@ func (f *VFSFile) hasTargetTime() bool {
 	return f.targetTime != nil
 }
 
-func (f *VFSFile) Open() error {
+func (f *VFSFile) Open() (retErr error) {
 	f.logger.Debug("opening file")
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		// A failed open is never installed in SQLite's file registry, so no
+		// subsequent xClose will reclaim a buffer opened before index loading.
+		f.cancel()
+		if f.bufferFile != nil {
+			retErr = errors.Join(retErr, f.bufferFile.Close())
+			f.bufferFile = nil
+			if err := os.Remove(f.bufferPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				retErr = errors.Join(retErr, fmt.Errorf("remove failed-open buffer: %w", err))
+			}
+		}
+	}()
 
 	// Try to get restore plan. For write-enabled VFS, we can create a new database
 	// if no LTX files exist yet.
@@ -1225,7 +1255,7 @@ func (f *VFSFile) openNewDatabase() error {
 
 	// Initialize write buffer file for durability
 	if err := f.initWriteBuffer(); err != nil {
-		f.logger.Warn("failed to initialize write buffer", "error", err)
+		return fmt.Errorf("initialize write buffer: %w", err)
 	}
 
 	// Start monitoring for new LTX files (in case another writer creates the database)
@@ -2021,25 +2051,14 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		return err
 	}
 
-	// Create LTX file from dirty pages
-	ltxReader, encoded := f.createLTXFromDirty()
-
-	// Upload LTX file to remote
-	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
-	// Always stop and join the encoder, including an upload that fails before
-	// reading the pipe. The buffer must not be reused while it is still read.
-	_ = ltxReader.CloseWithError(err)
-	result := <-encoded
+	info, index, err := f.uploadDirtyLTX(ctx)
 	if err != nil {
-		return fmt.Errorf("upload LTX: %w", err)
-	}
-	if result.err != nil {
-		return fmt.Errorf("encode LTX: %w", result.err)
+		return err
 	}
 
 	// Publish the exact offsets produced by the local encoder before dropping
 	// dirty pages. Cache eviction must never expose an older remote page.
-	for pgno, elem := range result.index {
+	for pgno, elem := range index {
 		f.index[pgno] = elem
 		if f.pendingReplace {
 			f.pending[pgno] = elem
@@ -2056,6 +2075,10 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
+	select {
+	case f.pollWake <- struct{}{}:
+	default:
+	}
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -2137,13 +2160,59 @@ type vfsEncodedLTX struct {
 // hasDirtyWrites requires f.mu.
 func (f *VFSFile) hasDirtyWrites() bool { return len(f.dirty) > 0 || f.sizeDirty }
 
-// createLTXFromDirty streams the dirty pages and reports their encoded offsets.
-// The caller must hold f.mu, close the reader, and wait for the result before
-// modifying/reusing the buffer, even if the upload fails without reading it.
-func (f *VFSFile) createLTXFromDirty() (*io.PipeReader, <-chan vfsEncodedLTX) {
+// uploadDirtyLTX requires f.mu throughout encoding and upload. Neither dirty
+// pages nor their index are published/cleared until the upload succeeds.
+func (f *VFSFile) uploadDirtyLTX(ctx context.Context) (*ltx.FileInfo, map[uint32]ltx.PageIndexElem, error) {
+	if int64(len(f.dirty))*int64(f.pageSize) <= vfsSmallLTXPageBytes {
+		f.ltxBuffer.Reset()
+		defer func() {
+			if f.ltxBuffer.Cap() > vfsLTXBufferLimit {
+				f.ltxBuffer = bytes.Buffer{}
+			}
+		}()
+		index, err := f.encodeDirtyLTX(&f.ltxBuffer)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode LTX: %w", err)
+		}
+		// A seekable, known-size body also lets the storage SDK retry without
+		// copying the encoded contents into another stream buffer.
+		info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, bytes.NewReader(f.ltxBuffer.Bytes()))
+		if err != nil {
+			return nil, nil, fmt.Errorf("upload LTX: %w", err)
+		}
+		return info, index, nil
+	}
+
 	pr, pw := io.Pipe()
 	done := make(chan vfsEncodedLTX, 1)
+	go func() {
+		// Coalesce encoder header/page/index writes instead of waking the
+		// pipe reader for each small field. Scratch size is independent of DB size.
+		w := bufio.NewWriterSize(pw, vfsSmallLTXPageBytes)
+		index, err := f.encodeDirtyLTX(w)
+		if err == nil {
+			err = w.Flush()
+		}
+		_ = pw.CloseWithError(err)
+		done <- vfsEncodedLTX{index: index, err: err}
+	}()
+	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, pr)
+	// Always join, even if an upload fails before reading. The goroutine
+	// accesses f's write buffer under this caller's still-held lock.
+	_ = pr.CloseWithError(err)
+	result := <-done
+	if err != nil {
+		return nil, nil, fmt.Errorf("upload LTX: %w", err)
+	}
+	if result.err != nil {
+		return nil, nil, fmt.Errorf("encode LTX: %w", result.err)
+	}
+	return info, result.index, nil
+}
 
+// encodeDirtyLTX requires f.mu (or a caller holding it until this call returns).
+// It shares one page scratch buffer; EncodePage consumes the page synchronously.
+func (f *VFSFile) encodeDirtyLTX(w io.Writer) (map[uint32]ltx.PageIndexElem, error) {
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
 	for pgno := range f.dirty {
@@ -2151,77 +2220,42 @@ func (f *VFSFile) createLTXFromDirty() (*io.PipeReader, <-chan vfsEncodedLTX) {
 	}
 	slices.Sort(pgnos)
 
-	// Copy dirty map offsets for goroutine access
-	dirtyOffsets := make(map[uint32]int64, len(f.dirty))
-	for pgno, off := range f.dirty {
-		dirtyOffsets[pgno] = off
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  f.pageSize,
+		Commit:    f.commit,
+		MinTXID:   f.pendingTXID,
+		MaxTXID:   f.pendingTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		return nil, fmt.Errorf("encode header: %w", err)
 	}
 
-	// Capture values for goroutine
-	pageSize := f.pageSize
-	commit := f.commit
-	pendingTXID := f.pendingTXID
-	bufferFile := f.bufferFile
-
-	go func() {
-		var err error
-		index := make(map[uint32]ltx.PageIndexElem, len(pgnos))
-		defer func() {
-			_ = pw.CloseWithError(err)
-			done <- vfsEncodedLTX{index: index, err: err}
-		}()
-
-		enc, encErr := ltx.NewEncoder(pw)
-		if encErr != nil {
-			err = encErr
-			return
+	index := make(map[uint32]ltx.PageIndexElem, len(pgnos))
+	data := make([]byte, f.pageSize)
+	lockPgno := ltx.LockPgno(f.pageSize)
+	for _, pgno := range pgnos {
+		if pgno == lockPgno {
+			continue
 		}
-
-		// Encode header
-		if err = enc.EncodeHeader(ltx.Header{
-			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  pageSize,
-			Commit:    commit,
-			MinTXID:   pendingTXID,
-			MaxTXID:   pendingTXID,
-			Timestamp: time.Now().UnixMilli(),
-		}); err != nil {
-			err = fmt.Errorf("encode header: %w", err)
-			return
+		if _, err := f.bufferFile.ReadAt(data, f.dirty[pgno]); err != nil {
+			return nil, fmt.Errorf("read page %d from buffer: %w", pgno, err)
 		}
-
-		// Encode each dirty page
-		lockPgno := ltx.LockPgno(pageSize)
-		for _, pgno := range pgnos {
-			if pgno == lockPgno {
-				continue // Skip lock page
-			}
-
-			// Read page data from buffer file
-			bufferOff := dirtyOffsets[pgno]
-			data := make([]byte, pageSize)
-			if _, err = bufferFile.ReadAt(data, bufferOff); err != nil {
-				err = fmt.Errorf("read page %d from buffer: %w", pgno, err)
-				return
-			}
-
-			offset := enc.N()
-			if err = enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
-				err = fmt.Errorf("encode page %d: %w", pgno, err)
-				return
-			}
-			index[pgno] = ltx.PageIndexElem{Level: 0, MinTXID: pendingTXID, MaxTXID: pendingTXID, Offset: offset, Size: enc.N() - offset}
+		offset := enc.N()
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			return nil, fmt.Errorf("encode page %d: %w", pgno, err)
 		}
-
-		// Close encoder (writes trailer and page index)
-		if err = enc.Close(); err != nil {
-			err = fmt.Errorf("close encoder: %w", err)
-			return
-		}
-	}()
-
-	return pr, done
+		index[pgno] = ltx.PageIndexElem{Level: 0, MinTXID: f.pendingTXID, MaxTXID: f.pendingTXID, Offset: offset, Size: enc.N() - offset}
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("close encoder: %w", err)
+	}
+	return index, nil
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
@@ -2609,18 +2643,34 @@ func isRetryablePageError(err error) bool {
 }
 
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
-	ticker := time.NewTicker(f.PollInterval)
-	defer ticker.Stop()
+	base := f.PollInterval
+	ceiling := max(base, f.MaxPollInterval)
+	interval := base
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	active := false
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-f.pollWake:
+			active = true
+			if interval > base {
+				interval = base
+				timer.Reset(base)
+			}
+		case <-timer.C:
 			if f.hasTargetTime() {
+				timer.Reset(base)
 				continue
 			}
-			if err := f.pollReplicaClient(ctx); err != nil {
+			f.mu.Lock()
+			before, beforeL1 := f.pos, f.maxTXID1
+			busy := f.inTransaction || f.hasDirtyWrites()
+			f.mu.Unlock()
+			err := f.pollReplicaClient(ctx)
+			if err != nil {
 				// Don't log context cancellation errors during shutdown
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					f.logger.Error("cannot fetch new ltx files", "error", err)
@@ -2631,8 +2681,25 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 				f.lastPollSuccess = time.Now()
 				f.mu.Unlock()
 			}
+			f.mu.Lock()
+			changed := f.pos != before || f.maxTXID1 != beforeL1
+			f.mu.Unlock()
+			interval = nextPollInterval(interval, base, ceiling, active || busy || changed || err != nil)
+			active = false
+			timer.Reset(interval)
 		}
 	}
+}
+
+func nextPollInterval(current, base, ceiling time.Duration, active bool) time.Duration {
+	if active {
+		return base
+	}
+	// Avoid overflowing time.Duration when doubling user-supplied intervals.
+	if current >= ceiling-current {
+		return ceiling
+	}
+	return min(current*2, ceiling)
 }
 
 // vfsTruncation invalidates older page versions past a committed file size.
