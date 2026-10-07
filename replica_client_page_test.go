@@ -7,10 +7,11 @@ import (
 	"io"
 	"testing"
 
-	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/mock"
 	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestFetchPageRetainsOnlyPageBytes(t *testing.T) {
