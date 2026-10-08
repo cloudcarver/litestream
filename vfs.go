@@ -605,9 +605,12 @@ func (tf *localTempFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic
 
 // VFSFile implements the SQLite VFS file interface.
 type VFSFile struct {
-	mu     sync.Mutex
-	client ReplicaClient
-	name   string
+	mu         sync.Mutex
+	pollMu     sync.Mutex // Serializes discovery with explicit reference refresh.
+	pollCancel context.CancelFunc
+	refreshing bool
+	client     ReplicaClient
+	name       string
 
 	pos              ltx.Pos  // Last TXID read from level 0 or 1
 	maxTXID1         ltx.TXID // Last TXID read from level 1
@@ -2712,11 +2715,21 @@ type vfsTruncation struct {
 // pollReplicaClient fetches metadata without holding f.mu, then atomically
 // installs it only if the local writer/snapshot has not moved in the meantime.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
+	f.pollMu.Lock()
+	defer f.pollMu.Unlock()
 	f.mu.Lock()
-	if f.targetTime != nil || (f.writeEnabled && (f.inTransaction || f.hasDirtyWrites())) {
+	if f.refreshing || f.targetTime != nil || (f.writeEnabled && (f.inTransaction || f.hasDirtyWrites())) {
 		f.mu.Unlock()
 		return nil
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	f.pollCancel = cancel
+	defer func() {
+		cancel()
+		f.mu.Lock()
+		f.pollCancel = nil
+		f.mu.Unlock()
+	}()
 	pos, maxTXID1Snapshot := f.pos, f.maxTXID1
 	baseCommit := f.commit
 	if f.pendingCommitSet {
@@ -2824,6 +2837,69 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			f.hydrator.Disable()
 			return fmt.Errorf("apply hydrated updates: %w", err)
 		}
+	}
+	return nil
+}
+
+// RefreshIndex replaces all physical file references between transactions.
+// Callers must keep the old references protected until EVERY reader and writer
+// has succeeded. No connection, write buffer or unchanged page cache is closed.
+// A canceled/failed refresh leaves this file's index and caches intact.
+func (f *VFSFile) RefreshIndex(ctx context.Context) error {
+	f.mu.Lock()
+	if f.refreshing || f.lockType >= sqlite3vfs.LockShared || f.inTransaction || f.hasDirtyWrites() || f.targetTime != nil || f.hydrator != nil {
+		f.mu.Unlock()
+		return sqlite3vfs.BusyError
+	}
+	f.refreshing = true
+	if f.pollCancel != nil {
+		f.pollCancel()
+	}
+	f.mu.Unlock()
+	// A reader's discovery may be long-polling. Cancel and join it before
+	// replacing the index so no late result can reinstall a retired address.
+	f.pollMu.Lock()
+	defer f.pollMu.Unlock()
+	defer func() { f.mu.Lock(); f.refreshing = false; f.mu.Unlock() }()
+	infos, err := CalcRestorePlan(ctx, f.client, 0, time.Time{}, f.logger)
+	if err != nil {
+		return fmt.Errorf("refresh restore plan: %w", err)
+	}
+	index, commit, err := f.buildIndexMap(ctx, infos)
+	if err != nil {
+		return fmt.Errorf("refresh page index: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var head ltx.TXID
+	if len(infos) > 0 {
+		head = infos[len(infos)-1].MaxTXID
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lockType >= sqlite3vfs.LockShared || f.inTransaction || f.hasDirtyWrites() || head < f.pos.TXID || (f.writeEnabled && head != f.pos.TXID) {
+		return sqlite3vfs.BusyError
+	}
+	if head == f.pos.TXID && commit != f.commit {
+		return fmt.Errorf("refresh changed database size at the same TXID")
+	}
+	for _, pgno := range f.cache.Keys() {
+		next, exists := index[pgno]
+		old, known := f.index[pgno]
+		// At the same database TXID compaction changes only locations, even
+		// when the containing LTX's MaxTXID increases for an unchanged page.
+		if !exists || !known || (head != f.pos.TXID && next.MaxTXID != old.MaxTXID) {
+			f.cache.Remove(pgno)
+		}
+	}
+	f.index = index
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pendingReplace, f.pendingCommitSet = false, false
+	f.commit, f.pos.TXID = commit, head
+	f.maxTXID1 = maxLevelTXID(infos, 1)
+	if f.maxTXID1 == 0 {
+		f.maxTXID1 = head
 	}
 	return nil
 }
