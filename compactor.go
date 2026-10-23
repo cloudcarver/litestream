@@ -120,7 +120,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	defer func() {
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+				if err := closer.Close(); err != nil {
+					c.logger.Warn("close compaction source", "error", err)
+				}
 			}
 		}
 	}()
@@ -145,11 +147,13 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			}
 		}
 
-		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		// Own the initial request context as well as reconnects, so a
+		// stalled first read can be interrupted without cancelling the batch.
+		r, err := internal.OpenResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, c.logger)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
+		rdrs = append(rdrs, r)
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction

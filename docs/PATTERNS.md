@@ -268,25 +268,43 @@ type LTXFileOpener interface {
 }
 ```
 
-### Two Failure Modes
+### Failure Modes
 
 1. **Non-EOF errors** (connection reset, timeout) — stream broke mid-transfer
 2. **Premature EOF** — server closed cleanly, but `offset < size` (known file size)
+3. **Silent reads** — no response from a reader-owned stream for 30 seconds;
+   cancel its request context and reconnect
 
 ### Key Behaviors
 
-- Max 3 retries (`resumableReaderMaxRetries = 3`)
+- Max 3 retries without a full successful read (`resumableReaderMaxRetries = 3`);
+  full successful reads renew the budget
 - Tracks current byte `offset` for range-request resume
 - Returns partial reads without error so callers like `io.ReadFull` naturally retry
 - Reopens from current offset using `OpenLTXFile(ctx, level, min, max, offset, 0)`
+- `Close` cancels the stream, interrupts pending opens and backoff, and permanently prevents reopening
+- The watchdog reuses one timer per stream. Healthy reads allocate no new timer
+  or callback. Stop the timer after each read; if its callback started, join
+  cancellation before resetting it or opening a replacement. Time between
+  reads is not a stall, and each new read receives its full 30-second allowance.
+- An opener returning both a body and an error transfers cleanup to the reader:
+  cancel the request before closing the body. Preserve cleanup errors in the
+  returned error, and log failed reopen cleanup at WARN if recovery may consume it.
 
 ### DO: Use ResumableReader for restore streams
 
 ```go
-rc, _ := client.OpenLTXFile(ctx, level, min, max, 0, fileInfo.Size)
-rr := internal.NewResumableReader(ctx, client, level, min, max, fileInfo.Size, rc, logger)
+rr, err := internal.OpenResumableReader(ctx, client, level, min, max, fileInfo.Size, logger)
+if err != nil {
+    return err
+}
 defer rr.Close()
 ```
+
+For lazy opening, pass `rc=nil` to `NewResumableReader`. An externally opened
+`rc` has no reader-owned cancellation function and cannot receive stall
+protection until the first reconnect. Storage implementations must honor the
+request context to interrupt a blocked read.
 
 ### DON'T: Use raw OpenLTXFile during long restore operations
 
