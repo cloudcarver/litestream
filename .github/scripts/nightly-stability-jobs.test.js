@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { classifyJobs } = require('./nightly-stability-jobs');
@@ -269,4 +270,87 @@ async function runNotifierScript({ context, github, core, fetch }) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const execute = new AsyncFunction('require', 'context', 'github', 'core', 'fetch', scriptLines.join('\n'));
   await execute(require, context, github, core, fetch);
+}
+
+for (const failureStage of ['list', 'create', 'none']) {
+  test(`preserves race evidence when Issues ${failureStage === 'none' ? 'succeeds' : failureStage + ' fails'}`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nightly-summary-'));
+    const summaryPath = path.join(dir, 'summary.md');
+    const prior = { workspace: process.env.GITHUB_WORKSPACE, summary: process.env.GITHUB_STEP_SUMMARY };
+    process.env.GITHUB_WORKSPACE = process.cwd();
+    process.env.GITHUB_STEP_SUMMARY = summaryPath;
+    const failures = [];
+    const created = [];
+    const disabled = Object.assign(new Error('Issues has been disabled in this repository.'), { status: 410 });
+    const raceLog = [
+      '2026-10-26T08:45:50.7823556Z WARNING: DATA RACE',
+      '2026-10-26T08:45:50.7823556Z Write at 0x123 by goroutine 1:',
+      '2026-10-26T08:45:50.7823556Z   github.com/benbjohnson/litestream.(*DB).Close()',
+      '2026-10-26T08:45:50.7823556Z     /work/litestream/db.go:860 +0x3f4',
+      '2026-10-26T08:45:50.7823556Z Previous read at 0x123 by goroutine 2:',
+      '2026-10-26T08:45:50.7823556Z   github.com/benbjohnson/litestream.(*DB).writeLTXFromDB()',
+      '2026-10-26T08:45:50.7823556Z     /work/litestream/db.go:2324 +0x6f1',
+      '2026-10-26T08:45:50.7823556Z ==================',
+      'level=WARN msg="shutdown sync failed, retrying" error="write ltx file: persistent error"',
+    ].join('\n');
+    const jobs = [{
+      id: 1,
+      name: 'Race Detector Sweep',
+      conclusion: 'failure',
+      steps: [{ name: 'Run tests with race detector (3x)', conclusion: 'failure' }],
+    }];
+    const assertEvidenceSaved = () => {
+      const summary = fs.readFileSync(summaryPath, 'utf8');
+      assert.match(summary, /data race: litestream\.\(\*DB\)\.Close vs litestream\.\(\*DB\)\.writeLTXFromDB/);
+      assert.match(summary, /db.go:860/);
+      assert.match(summary, /db.go:2324/);
+      assert.doesNotMatch(summary, /persistent error/);
+    };
+    try {
+      await runNotifierScript({
+        context: {
+          repo: { owner: 'cloudcarver', repo: 'litestream' }, runId: 456,
+          serverUrl: 'https://github.com', ref: 'refs/heads/main', sha: '5ffc3766d7c4af8a',
+        },
+        github: {
+          paginate: async route => {
+            if (typeof route === 'string') return jobs;
+            assertEvidenceSaved();
+            if (failureStage === 'list') throw disabled;
+            return [];
+          },
+          rest: { issues: {
+            listForRepo: () => {},
+            create: async input => {
+              assertEvidenceSaved();
+              if (failureStage === 'create') throw disabled;
+              created.push(input);
+              return { data: { number: 42, html_url: 'https://github.com/cloudcarver/litestream/issues/42' } };
+            },
+          } },
+        },
+        core: { setFailed: message => failures.push(message) },
+        fetch: async () => ({ ok: true, text: async () => raceLog }),
+      });
+      assertEvidenceSaved();
+      const summary = fs.readFileSync(summaryPath, 'utf8');
+      if (failureStage === 'none') {
+        assert.deepEqual(failures, []);
+        assert.equal(created.length, 1);
+        assert.match(created[0].title, /data race/);
+        assert.match(summary, /Tracking issue: #42/);
+      } else {
+        assert.equal(created.length, 0);
+        assert.equal(failures.length, 1);
+        assert.match(failures[0], /HTTP 410/);
+        assert.match(summary, /Notification failed:.*HTTP 410/);
+      }
+    } finally {
+      for (const [key, value] of [['GITHUB_WORKSPACE', prior.workspace], ['GITHUB_STEP_SUMMARY', prior.summary]]) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
 }

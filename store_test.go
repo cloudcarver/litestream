@@ -304,11 +304,16 @@ func TestStore_Integration(t *testing.T) {
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
 
+	logger := db.Logger
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
 		{Level: 1, Interval: factor * 200 * time.Millisecond},
 		{Level: 2, Interval: factor * 500 * time.Millisecond},
 	})
+	// NewStore installs the default logger. Preserve the test's debug handler
+	// so nightly artifacts include snapshot and shutdown lifecycle records.
+	store.Logger = logger.With(litestream.LogKeySystem, litestream.LogSystemStore)
+	db.SetLogger(logger)
 	store.SnapshotInterval = factor * 1 * time.Second
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)

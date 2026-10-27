@@ -277,10 +277,16 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	// Stop the compaction, snapshot & retention monitors before closing the
-	// databases so no snapshot is still reading a database's file handle.
+	startedAt := time.Now()
+	s.Logger.Debug("store close", "phase", "cancel_monitors")
+	defer func() {
+		s.Logger.Debug("store close", "phase", "finished", "elapsed", time.Since(startedAt), "error", err)
+	}()
+	// Stop producers before tearing down the databases they use. Snapshot
+	// cancellation also interrupts blocked pipe writes and joins the encoder.
 	s.cancel()
 	s.wg.Wait()
+	s.Logger.Debug("store close", "phase", "monitors_stopped")
 
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)

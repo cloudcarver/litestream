@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -78,6 +79,11 @@ type DB struct {
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+
+	// Snapshots hold chkMu until their encoder exits. Admission is serialized
+	// by execSem; Close cancels them and drains chkMu before releasing handles.
+	snapshotSeq     uint64 // protected by execSem
+	activeSnapshots atomic.Int64
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -872,6 +878,12 @@ func (db *DB) Open() (err error) {
 // and closes the database. If Done is set, closing it interrupts the shutdown
 // sync retry loop and cancels any in-flight sync attempt.
 func (db *DB) Close(ctx context.Context) (err error) {
+	startedAt := time.Now()
+	logger := db.Logger.With("path", db.path)
+	logger.Debug("db close", "phase", "cancel", "active_snapshots", db.activeSnapshots.Load())
+	defer func() {
+		logger.Debug("db close", "phase", "finished", "elapsed", time.Since(startedAt), "error", err)
+	}()
 	db.cancel()
 	db.wg.Wait()
 
@@ -885,6 +897,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	}
 	defer db.execSem.Release(1)
 
+	// No new snapshot can be admitted while execSem is held. Cancellation
+	// unblocks pipe writes even when the caller has abandoned the reader.
+	// The checkpoint lock is released only after each encoder has exited.
+	logger.Debug("db close", "phase", "wait_snapshots", "active_snapshots", db.activeSnapshots.Load())
+	db.chkMu.Lock()
+	logger.Debug("db close", "phase", "snapshots_stopped", "active_snapshots", db.activeSnapshots.Load())
+	db.chkMu.Unlock()
+
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
 		if _, e := db.syncLocked(ctx, 0); e != nil {
@@ -895,8 +915,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	// Ensure replicas perform a final sync and stop replicating.
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
-				err = e
+			if e := db.syncReplicaWithRetry(ctx); e != nil {
+				if err == nil {
+					err = e
+				} else if errors.Is(e, ErrShutdownInterrupted) {
+					logger.Warn("shutdown sync interrupted after another close error", "error", e)
+				} else {
+					logger.Error("shutdown sync failed after another close error", "error", e)
+				}
 			}
 		}
 		db.Replica.Stop(true)
@@ -904,8 +930,12 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Release the read lock to allow other applications to handle checkpointing.
 	if db.rtx != nil {
-		if e := db.releaseReadLock(); e != nil && err == nil {
-			err = e
+		if e := db.releaseReadLock(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("release read lock failed after another close error", "error", e)
+			}
 		}
 	}
 
@@ -919,16 +949,25 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.mu.Unlock()
 
 	if sqlDB != nil {
-		if e := sqlDB.Close(); e != nil && err == nil {
-			err = e
+		if e := sqlDB.Close(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("close SQL handle failed after another close error", "error", e)
+			}
 		}
 	}
 
 	if f != nil {
-		if e := f.Close(); e != nil && err == nil {
-			err = e
+		if e := f.Close(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("close database file failed after another close error", "error", e)
+			}
 		}
 	}
+	logger.Debug("db close", "phase", "files_closed", "error", err)
 
 	// Remove this database's series now that the final sync has recorded
 	// its last values.
@@ -2754,31 +2793,38 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 }
 
 type snapshotReadPosition struct {
+	id           uint64
 	pos          ltx.Pos
 	pageSize     int
 	walEndOffset int64
 	db           *DB
-	closeOnce    sync.Once
+	dbCtx        context.Context
 }
 
 func (p *snapshotReadPosition) close() {
-	p.closeOnce.Do(func() { p.db.chkMu.RUnlock() })
+	p.db.activeSnapshots.Add(-1)
+	p.db.chkMu.RUnlock()
 }
 
 type snapshotReadCloser struct {
 	*io.PipeReader
-	pos *snapshotReadPosition
+	cancel context.CancelCauseFunc
+	done   <-chan struct{}
 }
 
 func (r *snapshotReadCloser) Close() error {
-	defer r.pos.close()
-	return r.PipeReader.Close()
+	r.cancel(io.ErrClosedPipe)
+	err := r.PipeReader.Close()
+	<-r.done
+	return err
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 // Internal checkpoints remain disabled until the reader reaches EOF or is
 // closed. Callers must close readers they do not fully consume; abandoning a
-// reader blocks checkpoints indefinitely.
+// reader blocks checkpoints until its context is canceled or the DB is closed.
+// Closing the DB cancels active readers with os.ErrClosed and waits for their
+// encoders before releasing database files. Closing a reader also joins its encoder.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
@@ -2794,10 +2840,20 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error
 }
 
 func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	if err := db.lockExec(ctx); err != nil {
 		return nil, err
 	}
 	defer db.execSem.Release(1)
+
+	db.mu.RLock()
+	dbCtx := db.ctx
+	db.mu.RUnlock()
+	if dbCtx.Err() != nil {
+		return nil, os.ErrClosed
+	}
 
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
@@ -2824,11 +2880,15 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	// checkpoint can run between capturing pos and locking chkMu — the
 	// snapshot always matches the advertised position.
 	db.chkMu.RLock()
+	db.snapshotSeq++
+	db.activeSnapshots.Add(1)
 	return &snapshotReadPosition{
+		id:           db.snapshotSeq,
 		pos:          pos,
 		pageSize:     pageSize,
 		walEndOffset: walEndOffset,
 		db:           db,
+		dbCtx:        dbCtx,
 	}, nil
 }
 
@@ -2874,100 +2934,120 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 }
 
 func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.ReadCloser, error) {
-	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
+	startedAt := time.Now()
+	logger := db.Logger.With("path", db.path, "snapshot_id", pos.id, "txid", pos.pos.TXID.String())
+	logger.Debug("snapshot started", "wal_end_offset", pos.walEndOffset, "active_snapshots", db.activeSnapshots.Load())
 
-	// TODO(ltx): Read database size from database header.
-
+	// pos holds chkMu, so Close cannot release this file during setup.
 	fi, err := db.f.Stat()
 	if err != nil {
+		logger.Debug("snapshot finished", "elapsed", time.Since(startedAt), "error", err)
 		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(pos.pageSize))
 
-	// Execute encoding in a separate goroutine so the caller can initialize before reading.
+	ctx, cancel := context.WithCancelCause(ctx)
+	stopDBCancel := context.AfterFunc(pos.dbCtx, func() { cancel(os.ErrClosed) })
 	pr, pw := io.Pipe()
+	// A canceled reader must interrupt a producer blocked in PipeWriter.Write,
+	// including when no consumer ever reads from the pipe.
+	stopPipeCancel := context.AfterFunc(ctx, func() {
+		if err := pw.CloseWithError(context.Cause(ctx)); err != nil {
+			logger.Error("cancel snapshot pipe", "error", err)
+		}
+	})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer pos.close()
+		defer cancel(nil)
+		defer stopDBCancel()
+		defer stopPipeCancel()
 
-		walFile, err := os.Open(db.WALPath())
-		if err != nil {
-			pw.CloseWithError(err)
-			return
+		err := db.encodeSnapshot(ctx, pw, pos, commit)
+		cause := context.Cause(ctx)
+		if closeErr := pw.CloseWithError(err); closeErr != nil {
+			logger.Error("close snapshot pipe", "error", closeErr)
 		}
-		defer walFile.Close()
-
-		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
-			return
-		}
-
-		// Build a mapping of changed page numbers and their latest content.
-		maxBytes := pos.walEndOffset - WALHeaderSize
-		pageMap := make(map[uint32]int64)
-		var maxOffset int64
-		var walCommit uint32
-		if maxBytes > 0 {
-			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
-			if err != nil {
-				pw.CloseWithError(fmt.Errorf("page map: %w", err))
-				return
-			}
-		}
-		if walCommit > 0 {
-			commit = walCommit
-		}
-
-		if maxOffset > pos.walEndOffset {
-			pw.CloseWithError(fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset))
-			return
-		}
-		walOffset, walSize := snapshotHeaderWALRange(maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
-
-		db.Logger.Debug("encode snapshot header",
-			"txid", pos.pos.TXID.String(),
-			"commit", commit,
-			"walOffset", walOffset,
-			"walSize", walSize,
-			"walEndOffset", pos.walEndOffset,
-			"salt1", rd.salt1,
-			"salt2", rd.salt2)
-
-		enc, err := ltx.NewEncoder(pw)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
-			return
-		}
-		if err := enc.EncodeHeader(ltx.Header{
-			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(pos.pageSize),
-			Commit:    commit,
-			MinTXID:   1,
-			MaxTXID:   pos.pos.TXID,
-			Timestamp: time.Now().UnixMilli(),
-			WALOffset: walOffset,
-			WALSize:   walSize,
-			WALSalt1:  rd.salt1,
-			WALSalt2:  rd.salt2,
-		}); err != nil {
-			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
-			return
-		}
-
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
-			return
-		}
-
-		if err := enc.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
-			return
-		}
-		_ = pw.Close()
+		logger.Debug("snapshot finished", "elapsed", time.Since(startedAt),
+			"error", err, "cancel_cause", cause)
 	}()
 
-	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
+	return &snapshotReadCloser{PipeReader: pr, cancel: cancel, done: done}, nil
+}
+
+func (db *DB) encodeSnapshot(ctx context.Context, w io.Writer, pos *snapshotReadPosition, commit uint32) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, walFile.Close()) }()
+
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
+	if err != nil {
+		return fmt.Errorf("new wal reader: %w", err)
+	}
+
+	// Build a mapping of changed page numbers and their latest content.
+	maxBytes := pos.walEndOffset - WALHeaderSize
+	pageMap := make(map[uint32]int64)
+	var maxOffset int64
+	var walCommit uint32
+	if maxBytes > 0 {
+		pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+		if err != nil {
+			return fmt.Errorf("page map: %w", err)
+		}
+	}
+	if walCommit > 0 {
+		commit = walCommit
+	}
+
+	if maxOffset > pos.walEndOffset {
+		return fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset)
+	}
+	walOffset, walSize := snapshotHeaderWALRange(maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
+
+	db.Logger.Debug("encode snapshot header",
+		"snapshot_id", pos.id,
+		"txid", pos.pos.TXID.String(),
+		"commit", commit,
+		"walOffset", walOffset,
+		"walSize", walSize,
+		"walEndOffset", pos.walEndOffset,
+		"salt1", rd.salt1,
+		"salt2", rd.salt2)
+
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(pos.pageSize),
+		Commit:    commit,
+		MinTXID:   1,
+		MaxTXID:   pos.pos.TXID,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: walOffset,
+		WALSize:   walSize,
+		WALSalt1:  rd.salt1,
+		WALSalt2:  rd.salt2,
+	}); err != nil {
+		return fmt.Errorf("encode ltx snapshot header: %w", err)
+	}
+
+	if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		return fmt.Errorf("write snapshot ltx: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("close ltx snapshot encoder: %w", err)
+	}
+	return nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
@@ -3004,12 +3084,12 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 // It always writes, even when a snapshot already exists at the current
 // position, so operators can force a re-upload (replicate -force-snapshot).
 // Callers that want to skip duplicates check first, as Store.CompactDB does.
-func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+func (db *DB) Snapshot(ctx context.Context) (_ *ltx.FileInfo, err error) {
 	pos, r, err := db.SnapshotReader(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.Close() }()
+	defer func() { err = errors.Join(err, r.Close()) }()
 
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
