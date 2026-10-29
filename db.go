@@ -1785,7 +1785,11 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	}
 
 	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
-	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	fi, err := ltxFile.Stat()
+	if err != nil {
+		return info, fmt.Errorf("stat ltx file: %w", err)
+	}
+	lastPageMatch, err := db.lastPageMatch(ctx, dec, ltxFile, fi.Size(), prevWALOffset, frameSize)
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
@@ -1822,7 +1826,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 }
 
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
-func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, ltxFile io.ReaderAt, ltxSize, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
 		return false, nil
 	}
@@ -1840,24 +1844,30 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		return false, nil
 	}
 
-	// Verify that the last page in the WAL exists in the last LTX file.
-	buf := make([]byte, dec.Header().PageSize)
-	for {
-		var hdr ltx.PageHeader
-		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
-			return false, nil // page not found in LTX file
-		} else if err != nil {
-			return false, fmt.Errorf("decode ltx page: %w", err)
-		}
-
-		if pgno != hdr.Pgno {
-			continue // page number doesn't match
-		}
-		if !bytes.Equal(data, buf) {
-			continue // page data doesn't match
-		}
-		return true, nil // Page matches
+	// Use the page index to avoid decoding a multi-GiB snapshot for one WAL
+	// frame. Keep the original salt, page-number and byte-for-byte comparison.
+	elem, found, err := findLTXPage(ctx, ltxFile, ltxSize, pgno)
+	if err != nil {
+		return false, fmt.Errorf("find ltx page: %w", err)
+	} else if !found {
+		return false, nil
 	}
+	pageDecoder := ltx.NewDecoder(io.MultiReader(
+		io.NewSectionReader(ltxFile, 0, ltx.HeaderSize),
+		io.NewSectionReader(ltxFile, elem.Offset, elem.Size),
+	))
+	if err := pageDecoder.DecodeHeader(); err != nil {
+		return false, fmt.Errorf("decode indexed ltx header: %w", err)
+	}
+	buf := make([]byte, dec.Header().PageSize)
+	var hdr ltx.PageHeader
+	if err := pageDecoder.DecodePage(&hdr, buf); err != nil {
+		return false, fmt.Errorf("decode indexed ltx page: %w", err)
+	}
+	if hdr.Pgno != pgno {
+		return false, fmt.Errorf("ltx page index points to page %d, want %d", hdr.Pgno, pgno)
+	}
+	return bytes.Equal(data, buf), nil
 }
 
 // detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint

@@ -10,7 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -167,61 +167,40 @@ SELECT name FROM users WHERE id = 5;
 	}, 5*time.Second, 100*time.Millisecond, "hydration file should be created")
 }
 
+var extensionBuild struct {
+	sync.Once
+	path string
+	err  error
+}
+
 // buildVFSExtension builds the VFS extension and returns its path.
 func buildVFSExtension(t *testing.T) string {
 	t.Helper()
-
-	// Determine expected extension filename based on OS
-	var extName string
-	switch runtime.GOOS {
-	case "darwin":
-		extName = "litestream-vfs.dylib"
-	case "linux":
-		extName = "litestream-vfs.so"
-	default:
-		t.Fatalf("unsupported OS: %s", runtime.GOOS)
-	}
-
-	// Check if extension already exists in dist/
 	projectRoot := findProjectRoot(t)
-	extPath := filepath.Join(projectRoot, "dist", extName)
-
-	if _, err := os.Stat(extPath); err == nil {
-		return extPath
-	}
-
-	// Build the extension
-	t.Logf("building VFS extension at %s", extPath)
-
-	var makeTarget string
-	switch runtime.GOOS {
-	case "darwin":
-		if runtime.GOARCH == "arm64" {
-			makeTarget = "vfs-darwin-arm64"
-			extPath = filepath.Join(projectRoot, "dist", "litestream-vfs-darwin-arm64.dylib")
-		} else {
-			makeTarget = "vfs-darwin-amd64"
-			extPath = filepath.Join(projectRoot, "dist", "litestream-vfs-darwin-amd64.dylib")
+	// Rebuild from this checkout once per test process. An existing dist file
+	// may belong to another revision or dependency graph and is not evidence.
+	extensionBuild.Do(func() {
+		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+			extensionBuild.err = fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+			return
 		}
-	case "linux":
-		if runtime.GOARCH == "arm64" {
-			makeTarget = "vfs-linux-arm64"
-			extPath = filepath.Join(projectRoot, "dist", "litestream-vfs-linux-arm64.so")
-		} else {
-			makeTarget = "vfs-linux-amd64"
-			extPath = filepath.Join(projectRoot, "dist", "litestream-vfs-linux-amd64.so")
+		suffix := ".so"
+		if runtime.GOOS == "darwin" {
+			suffix = ".dylib"
 		}
+		target := "vfs-" + runtime.GOOS + "-" + runtime.GOARCH
+		extensionBuild.path = filepath.Join(projectRoot, "dist", "litestream-"+target+suffix)
+		cmd := exec.Command("make", target)
+		cmd.Dir = projectRoot
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			extensionBuild.err = fmt.Errorf("build current VFS extension: %w\n%s", err, output)
+		}
+	})
+	if extensionBuild.err != nil {
+		t.Fatal(extensionBuild.err)
 	}
-
-	cmd := exec.Command("make", makeTarget)
-	cmd.Dir = projectRoot
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("failed to build VFS extension: %v", err)
-	}
-
-	return extPath
+	return extensionBuild.path
 }
 
 // findProjectRoot finds the project root directory.
@@ -248,10 +227,12 @@ func findProjectRoot(t *testing.T) string {
 func runSQLiteCLI(t *testing.T, extPath string, env []string, query string) string {
 	t.Helper()
 
-	// Build command: sqlite3 :memory: -cmd ".load <ext>" "<query>"
+	// Load the extension before opening the replica with its registered VFS.
+	dbURI := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "replica.db")) + "?vfs=litestream"
 	args := []string{
-		":memory:",
-		"-cmd", ".load " + extPath,
+		"-bail", ":memory:",
+		"-cmd", ".load " + extPath + " sqlite3_litestreamvfs_init",
+		"-cmd", ".open " + dbURI,
 		query,
 	}
 
@@ -261,13 +242,6 @@ func runSQLiteCLI(t *testing.T, extPath string, env []string, query string) stri
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outputStr := string(output)
-		// Check for common extension loading failures
-		if strings.Contains(outputStr, "Error: unknown command") ||
-			strings.Contains(outputStr, "not authorized") ||
-			strings.Contains(outputStr, "symbol not found") ||
-			strings.Contains(outputStr, "dlsym") {
-			t.Skipf("skipping: sqlite3 cannot load extensions (common on macOS): %s", outputStr)
-		}
 		t.Logf("sqlite3 output: %s", outputStr)
 		t.Fatalf("sqlite3 command failed: %v", err)
 	}
@@ -296,8 +270,8 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
+	// Close the owning DB so its monitor stops before the replica is stopped.
 	require.NoError(t, db.Close(context.Background()))
 }
 
@@ -328,7 +302,7 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
+	// Close the owning DB so its monitor stops before the replica is stopped.
 	require.NoError(t, db.Close(context.Background()))
 }

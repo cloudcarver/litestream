@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 // TestVFS_FuzzSeedCorpus runs a handful of fixed corpora so `go test`
@@ -59,7 +58,6 @@ func runVFSFuzzWorkload(tb testing.TB, corpus []byte) {
 		tb.Fatalf("init replica dir: %v", err)
 	}
 	_, primary := openReplicatedPrimary(tb, client, 15*time.Millisecond, 15*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(tb, primary)
 
 	if _, err := primary.Exec(`CREATE TABLE fuzz (
         id INTEGER PRIMARY KEY,

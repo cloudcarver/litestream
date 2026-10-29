@@ -6,8 +6,10 @@ package main_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,13 +18,11 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestVFS_ChaosEngineering(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
-	db, primary := openReplicatedPrimary(t, client, 15*time.Millisecond, 15*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
+	_, primary := openReplicatedPrimary(t, client, 15*time.Millisecond, 15*time.Millisecond)
 
 	if _, err := primary.Exec(`CREATE TABLE chaos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,6 +165,9 @@ func TestVFS_ChaosEngineering(t *testing.T) {
 		t.Fatalf("writer error: %v", err)
 	}
 
+	// Check recovery after the fault window ends. Continued truncation and
+	// timeouts can prevent convergence even after the writer has stopped.
+	chaosClient.active.Store(false)
 	waitForTableRowCount(t, primary, replica, "chaos", 5*time.Second)
 	if chaosClient.failures.Load() == 0 {
 		t.Fatalf("expected injected failures")
@@ -180,16 +183,29 @@ func newChaosReplicaClient(base litestream.ReplicaClient) *chaosReplicaClient {
 
 type chaosReplicaClient struct {
 	litestream.ReplicaClient
+	rndMu    sync.Mutex
 	rnd      *rand.Rand
 	failures atomic.Int32
 	active   atomic.Bool
+}
+
+func (c *chaosReplicaClient) randomFloat() float64 {
+	c.rndMu.Lock()
+	defer c.rndMu.Unlock()
+	return c.rnd.Float64()
+}
+
+func (c *chaosReplicaClient) randomDelay() time.Duration {
+	c.rndMu.Lock()
+	defer c.rndMu.Unlock()
+	return time.Duration(c.rnd.Intn(5)) * time.Millisecond
 }
 
 func (c *chaosReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if !c.active.Load() {
 		return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
 	}
-	if c.rnd.Float64() < 0.05 {
+	if c.randomFloat() < 0.05 {
 		c.failures.Add(1)
 		return nil, context.DeadlineExceeded
 	}
@@ -200,11 +216,11 @@ func (c *chaosReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID
 	if !c.active.Load() {
 		return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 	}
-	delay := time.Duration(c.rnd.Intn(5)) * time.Millisecond
+	delay := c.randomDelay()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
-	if c.rnd.Float64() < 0.05 {
+	if c.randomFloat() < 0.05 {
 		c.failures.Add(1)
 		return nil, context.DeadlineExceeded
 	}
@@ -212,10 +228,9 @@ func (c *chaosReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID
 	if err != nil {
 		return nil, err
 	}
-	if c.rnd.Float64() < 0.05 && size > 0 {
+	if c.randomFloat() < 0.05 && size > 0 {
 		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
+		if err = errors.Join(err, rc.Close()); err != nil {
 			return nil, err
 		}
 		if len(data) > 32 {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -148,51 +149,53 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 	})
 
 	t.Run("ZeroTimeoutNoRetry", func(t *testing.T) {
-		db, sqldb := testingutil.MustOpenDBs(t)
+		synctest.Test(t, func(t *testing.T) {
+			db, sqldb := testingutil.MustOpenDBs(t)
 
-		// Write some data
-		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
-			t.Fatal(err)
-		}
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		if err := sqldb.Close(); err != nil {
-			t.Fatal(err)
-		}
+			// Write some data
+			if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := sqldb.Close(); err != nil {
+				t.Fatal(err)
+			}
 
-		// Create mock client that always fails
-		var attempts int32
-		client := &mock.ReplicaClient{
-			LTXFilesFunc: func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
-				return ltx.NewFileInfoSliceIterator(nil), nil
-			},
-			WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
-				atomic.AddInt32(&attempts, 1)
-				return nil, errors.New("error")
-			},
-		}
+			// Create mock client that always fails
+			var attempts int32
+			client := &mock.ReplicaClient{
+				LTXFilesFunc: func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+					return ltx.NewFileInfoSliceIterator(nil), nil
+				},
+				WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+					atomic.AddInt32(&attempts, 1)
+					return nil, errors.New("error")
+				},
+			}
 
-		db.Replica = litestream.NewReplicaWithClient(db, client)
-		db.ShutdownSyncTimeout = 0 // Disable retries
-		db.ShutdownSyncInterval = 50 * time.Millisecond
+			db.Replica = litestream.NewReplicaWithClient(db, client)
+			db.ShutdownSyncTimeout = 0 // Disable retries
+			db.ShutdownSyncInterval = 50 * time.Millisecond
 
-		// Close should fail after single attempt
-		start := time.Now()
-		err := db.Close(context.Background())
-		elapsed := time.Since(start)
+			// Close should fail after single attempt
+			start := time.Now()
+			err := db.Close(context.Background())
+			elapsed := time.Since(start)
 
-		if err == nil {
-			t.Fatal("expected error")
-		}
-		// Should have only made 1 attempt
-		if got := atomic.LoadInt32(&attempts); got != 1 {
-			t.Fatalf("expected exactly 1 attempt with zero timeout, got %d", got)
-		}
-		// Should be fast (no retry delay)
-		if elapsed > 100*time.Millisecond {
-			t.Fatalf("took too long for single attempt: %v", elapsed)
-		}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			// Should have only made 1 attempt
+			if got := atomic.LoadInt32(&attempts); got != 1 {
+				t.Fatalf("expected exactly 1 attempt with zero timeout, got %d", got)
+			}
+			// Virtual time detects retry delay, independent of disk/CPU scheduling.
+			if elapsed != 0 {
+				t.Fatalf("took too long for single attempt: %v", elapsed)
+			}
+		})
 	})
 
 	t.Run("SuccessFirstAttempt", func(t *testing.T) {

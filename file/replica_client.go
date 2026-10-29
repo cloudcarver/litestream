@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -156,6 +157,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and sets it as the file's ModTime to preserve original creation time.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
+	rd = &contextReader{ctx: ctx, reader: rd}
 	var fileInfo, dirInfo os.FileInfo
 	if db := c.db(); db != nil {
 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
@@ -191,13 +193,20 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	// Clean up temp file on error. On successful rename, the temp file
 	// becomes the final file and should not be removed.
 	defer func() {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			err = errors.Join(err, closeErr)
+		}
 		if err != nil {
-			_ = os.Remove(tmpFilename)
+			if removeErr := os.Remove(tmpFilename); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, removeErr)
+			}
 		}
 	}()
 
 	if _, err := io.Copy(f, fullReader); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := f.Sync(); err != nil {
@@ -221,6 +230,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
+	// Cancellation observed before publication must not replace the destination.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Move LTX file to final path when it has been written & synced to disk.
 	if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
@@ -375,4 +388,18 @@ func (c *ReplicaClient) OpenWALSegmentV3(ctx context.Context, generation string,
 		return nil, err
 	}
 	return internal.NewLZ4Reader(f), nil
+}
+
+// contextReader checks cancellation between reads so canceled compaction does
+// not keep copying a large local file while Store.Close waits for its goroutine.
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

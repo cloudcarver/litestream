@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -265,12 +266,17 @@ func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, du
 	return nil
 }
 
-func (db *TestDB) StartLitestream() error {
+func (db *TestDB) StartLitestream() (err error) {
 	logPath := filepath.Join(db.TempDir, "litestream.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return fmt.Errorf("create log file: %w", err)
 	}
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close parent log handle: %w", closeErr))
+		}
+	}()
 
 	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
 	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
@@ -281,7 +287,6 @@ func (db *TestDB) StartLitestream() error {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
 		return fmt.Errorf("start litestream: %w", err)
 	}
 
@@ -291,19 +296,23 @@ func (db *TestDB) StartLitestream() error {
 	time.Sleep(2 * time.Second)
 
 	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		logFile.Close()
 		return fmt.Errorf("litestream exited immediately")
 	}
 
 	return nil
 }
 
-func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
+func (db *TestDB) StartLitestreamWithConfig(configPath string) (err error) {
 	logPath := filepath.Join(db.TempDir, "litestream.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return fmt.Errorf("create log file: %w", err)
 	}
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close parent log handle: %w", closeErr))
+		}
+	}()
 
 	db.ConfigPath = configPath
 	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
@@ -314,7 +323,6 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
 		return fmt.Errorf("start litestream: %w", err)
 	}
 
@@ -330,33 +338,37 @@ func (db *TestDB) StopLitestream() error {
 	if db.LitestreamCmd == nil || db.LitestreamCmd.Process == nil {
 		return nil
 	}
+	cmd := db.LitestreamCmd
+	db.LitestreamCmd = nil // Wait exactly once, including explicit stop + Cleanup.
+	started := time.Now()
+	defer func() { db.t.Logf("Litestream shutdown completed in %s", time.Since(started)) }()
 
 	// Send SIGTERM for graceful shutdown so Litestream can flush pending syncs.
 	// On Windows, SIGTERM is unsupported — fall back to Kill().
 	if runtime.GOOS == "windows" {
-		db.LitestreamCmd.Process.Kill()
-		db.LitestreamCmd.Wait()
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("kill litestream: %w", err)
+		}
+		if err := cmd.Wait(); err != nil {
+			db.t.Logf("Litestream exit after forced Windows stop: %v", err)
+		}
 		time.Sleep(1 * time.Second)
 		return nil
 	}
-	if err := db.LitestreamCmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// Process may have already exited — check exit status.
-		if state, waitErr := db.LitestreamCmd.Process.Wait(); waitErr == nil && state != nil && !state.Success() {
-			return fmt.Errorf("litestream exited before shutdown: %s", state)
-		}
-		return nil
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		return errors.Join(fmt.Errorf("signal litestream: %w", err), cmd.Wait())
 	}
 
 	// Wait for graceful exit with timeout.
 	done := make(chan error, 1)
-	go func() { done <- db.LitestreamCmd.Wait() }()
+	go func() { done <- cmd.Wait() }()
 
 	var waitErr error
 	select {
 	case waitErr = <-done:
 	case <-time.After(35 * time.Second):
-		db.LitestreamCmd.Process.Kill()
-		waitErr = <-done
+		killErr := cmd.Process.Kill()
+		waitErr = errors.Join(fmt.Errorf("litestream shutdown exceeded 35s"), killErr, <-done)
 	}
 
 	time.Sleep(1 * time.Second)
@@ -515,7 +527,30 @@ func (db *TestDB) CheckForErrors() ([]string, error) {
 }
 
 func (db *TestDB) Cleanup() {
-	db.StopLitestream()
+	if err := db.StopLitestream(); err != nil {
+		db.t.Errorf("stop litestream during cleanup: %v", err)
+	}
+	if db.t.Failed() && db.LitestreamPID != 0 {
+		log, err := db.GetLitestreamLog()
+		if err != nil {
+			db.t.Errorf("read failed test's litestream log: %v", err)
+		} else {
+			db.t.Logf("Litestream child log:\n%s", log)
+		}
+	}
+}
+
+// AssertNoErrors is for normal replication tests, which must not silently
+// discard unrelated errors while looking for a particular historical defect.
+func (db *TestDB) AssertNoErrors() {
+	db.t.Helper()
+	errors, err := db.CheckForErrors()
+	if err != nil {
+		db.t.Fatalf("read litestream errors: %v", err)
+	}
+	if len(errors) != 0 {
+		db.t.Fatalf("unexpected litestream errors:\n%s", strings.Join(errors, "\n"))
+	}
 }
 
 // WaitForSnapshots waits for snapshots & WAL segments to appear on file replicas.

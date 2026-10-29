@@ -52,9 +52,8 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
-	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
+	testingutil.MustCloseSQLDB(t, sqldb0)
 
 	// Now open via writable VFS and add more data
 	vfs := newWritableVFS(t, client, 1*time.Second, t.TempDir())
@@ -953,9 +952,8 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
-	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
+	testingutil.MustCloseSQLDB(t, sqldb0)
 
 	// Open via VFS (should work with same page size)
 	vfs := newWritableVFS(t, client, 1*time.Second, t.TempDir())

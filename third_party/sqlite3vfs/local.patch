@@ -1,0 +1,13 @@
+--- a/sqlite3vfs.c
++++ b/sqlite3vfs.c
+@@ -61,7 +61,9 @@
+ 
+ int s3vfsOpen(sqlite3_vfs* vfs, const char * name, sqlite3_file* file, int flags, int *outFlags) {
+   int ret = goVFSOpen(vfs, name, file, flags, outFlags);
+-  file->pMethods = &s3vfs_io_methods;
++  /* A failed Go open has no registered file. Do not let SQLite call xClose
++     with its zero-initialized ID and close an unrelated live file. */
++  file->pMethods = ret == SQLITE_OK ? &s3vfs_io_methods : NULL;
+   return ret;
+ }
+ 

@@ -3319,77 +3319,60 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	pos1, _ := db.Pos()
 	t.Logf("after growth sync: txid=%d", pos1.TXID)
 
-	// Step 4: Run checkpoint CONCURRENTLY with more writes.
-	// The writer goroutine continuously inserts rows while checkpoint runs.
-	// This exercises the TOCTOU window where frames arrive after the
-	// pre-checkpoint sync but before WAL truncation.
-	writerCtx, cancelWriter := context.WithCancel(ctx)
-	writerDone := make(chan error, 1)
-	writerStarted := make(chan struct{})
-	var writtenRows int64
-
-	go func() {
-		var i int64 = 100
-		started := false
-		for {
-			select {
-			case <-writerCtx.Done():
-				writerDone <- nil
-				return
-			default:
-				blob := make([]byte, 4000)
-				_, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob)
-				if err != nil {
-					// SQLITE_BUSY is expected during concurrent checkpoint - retry
-					if strings.Contains(err.Error(), "database is locked") ||
-						strings.Contains(err.Error(), "SQLITE_BUSY") {
-						time.Sleep(time.Millisecond)
-						continue
-					}
-					writerDone <- err
-					return
-				}
-				atomic.AddInt64(&writtenRows, 1)
-				if !started {
-					close(writerStarted)
-					started = true
-				}
-				i++
-				time.Sleep(time.Millisecond)
+	// Hold an actual SQLite writer across the pre-checkpoint sync. Commit
+	// only after the diagnostic phase proves that sync has finished. This
+	// places new pages in the exact historical loss window without relying
+	// on an unbounded writer winning/losing a scheduler race within 5s.
+	writer, err := sqldb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := writer.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("rollback checkpoint writer: %v", err)
+		}
+	}()
+	for i := 100; i < 200; i++ {
+		if _, err := writer.ExecContext(ctx, `INSERT INTO t VALUES (?, ?)`, i, make([]byte, 4000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpointCtx, cancelCheckpoint := context.WithCancel(ctx)
+	defer cancelCheckpoint()
+	checkpointDone := make(chan error, 1)
+	go func() { checkpointDone <- db.Checkpoint(checkpointCtx, CheckpointModeTruncate) }()
+	joined := false
+	defer func() {
+		if !joined {
+			cancelCheckpoint()
+			if err := <-checkpointDone; err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("join checkpoint: %v", err)
 			}
 		}
 	}()
-
-	// Wait for the writer to confirm at least one successful write before
-	// starting the checkpoint. This avoids a timing-dependent 10ms sleep.
-	select {
-	case <-writerStarted:
-	case err := <-writerDone:
-		t.Fatalf("writer exited before starting: %v", err)
-	}
-	checkpointDeadline := time.Now().Add(5 * time.Second)
-	for {
-		err := db.Checkpoint(ctx, CheckpointModeTruncate)
-		if err == nil {
-			break
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for db.SyncDiagnostic().Phase != string(diagPhaseCheckpointExec) {
+		select {
+		case err := <-checkpointDone:
+			joined = true
+			t.Fatalf("checkpoint exited before reaching the held writer: %v", err)
+		case <-deadline.C:
+			t.Fatal("checkpoint did not reach the held writer")
+		case <-poll.C:
 		}
-		if !isSQLiteBusyError(err) || time.Now().After(checkpointDeadline) {
-			cancelWriter()
-			<-writerDone
-			t.Fatal(err)
-		}
-		time.Sleep(time.Millisecond)
 	}
-	cancelWriter()
-	if err := <-writerDone; err != nil {
+	if err := writer.Commit(); err != nil {
 		t.Fatal(err)
 	}
-
-	rows := atomic.LoadInt64(&writtenRows)
-	t.Logf("concurrent writer inserted %d rows during/around checkpoint", rows)
-	if rows == 0 {
-		t.Fatal("concurrent writer inserted 0 rows — race was not exercised")
+	err = <-checkpointDone
+	joined = true
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Log("committed 100 new pages after the pre-checkpoint sync")
 
 	// Log diagnostic info about what we expect
 	pos2, _ := db.Pos()
@@ -3546,6 +3529,23 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	if err := restoreReplica.Restore(ctx, restoreOpt); err != nil {
 		t.Fatalf("restore from local ltx chain: %v", err)
 	}
+	restored, err := sql.Open("sqlite", restorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := restored.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var restoredRows int
+	if err := restored.QueryRow(`SELECT count(*) FROM t`).Scan(&restoredRows); err != nil {
+		t.Fatal(err)
+	}
+	if restoredRows != 200 {
+		t.Fatalf("checkpoint lost commits from its pre-sync window: restored=%d want=200", restoredRows)
+	}
+
 }
 
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented

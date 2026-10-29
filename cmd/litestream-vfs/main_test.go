@@ -150,7 +150,7 @@ func TestVFS_Updating(t *testing.T) {
 	t.Log("ensuring replica has updated")
 	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 200, 10*time.Second, db.MonitorInterval)
 
-	if err := db.Replica.Stop(false); err != nil {
+	if err := db.Close(context.Background()); err != nil {
 		t.Fatalf("stop replica: %v", err)
 	}
 }
@@ -440,7 +440,6 @@ func TestVFS_LongRunningTxnStress(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value INTEGER)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -521,7 +520,14 @@ done:
 	}
 }
 
-func TestVFS_HighLoadConcurrentReads(t *testing.T) {
+// Race correctness uses a fixed operation count. Throughput is checked by
+// the separate normal-build test with its original 100 operations / 5s budget.
+func TestVFS_ConcurrentReadWriteCatchUp(t *testing.T) {
+	exerciseVFSConcurrentReads(t, 30*time.Second, 128)
+}
+
+func exerciseVFSConcurrentReads(t *testing.T, duration time.Duration, target int64) int64 {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping high-load test in short mode")
 	}
@@ -530,8 +536,7 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	vfs.PollInterval = 50 * time.Millisecond
 	vfsName := registerTestVFS(t, vfs)
 
-	_, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
 
 	if _, err := primary.Exec(`CREATE TABLE t (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -544,14 +549,18 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	seedLargeTable(t, primary, 2000)
 
 	replica := openVFSReplicaDB(t, vfsName)
-	defer replica.Close()
+	defer func() {
+		if err := replica.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	if _, err := replica.Exec("PRAGMA temp_store = MEMORY"); err != nil {
 		t.Fatalf("set temp_store: %v", err)
 	}
 
 	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	var writerOps atomic.Int64
@@ -585,13 +594,17 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 				}
 			}
 
-			writerOps.Add(1)
+			if n := writerOps.Add(1); target > 0 && n >= target {
+				cancel()
+				return
+			}
 			time.Sleep(time.Duration(rnd.Intn(5)+1) * time.Millisecond)
 		}
 	}()
 
-	readerErrCh := make(chan error, 1)
+	readerErrCh := make(chan error, 8)
 	var readerWg sync.WaitGroup
+	var readerOps [8]atomic.Int64
 	for i := 0; i < 8; i++ {
 		readerWg.Add(1)
 		go func(id int) {
@@ -613,6 +626,7 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 					readerErrCh <- fmt.Errorf("reader %d observed invalid stats", id)
 					return
 				}
+				readerOps[id].Add(1)
 			}
 		}(i)
 	}
@@ -631,22 +645,106 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	default:
 	}
 
-	if ops := writerOps.Load(); ops < 100 {
-		t.Fatalf("expected high write volume, got %d ops", ops)
+	t.Logf("completed writer operations: %d", writerOps.Load())
+	if target > 0 && (writerOps.Load() != target || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+		t.Fatalf("concurrent workload incomplete: got %d operations, want %d before %s", writerOps.Load(), target, duration)
+	}
+	for i := range readerOps {
+		if readerOps[i].Load() == 0 {
+			t.Fatalf("concurrent reader %d never made progress", i)
+		}
 	}
 
-	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
-
-	var primaryCount, replicaCount int
-	if err := primary.QueryRow("SELECT COUNT(*) FROM t").Scan(&primaryCount); err != nil {
+	// COUNT can match an intermediate snapshot during inserts and deletes.
+	// Publish the final TXID, then pin one replica connection through its
+	// catch-up check and verification; other pooled connections can still lag.
+	forceReplicaSync(t, db)
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer stop()
+	conn, err := replica.Conn(verifyCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	for {
+		var txid string
+		if err := conn.QueryRowContext(verifyCtx, "PRAGMA litestream_txid").Scan(&txid); err != nil {
+			t.Fatal(err)
+		}
+		if txid == pos.TXID.String() {
+			break
+		}
+		select {
+		case <-verifyCtx.Done():
+			t.Fatalf("replica TXID %s did not reach %s: %v", txid, pos.TXID, verifyCtx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	var primaryCount, replicaCount, primaryBytes, replicaBytes int
+	if err := primary.QueryRow("SELECT COUNT(*), IFNULL(SUM(LENGTH(value)), 0) FROM t").Scan(&primaryCount, &primaryBytes); err != nil {
 		t.Fatalf("primary count: %v", err)
 	}
-	if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&replicaCount); err != nil {
+	if err := conn.QueryRowContext(verifyCtx, "SELECT COUNT(*), IFNULL(SUM(LENGTH(value)), 0) FROM t").Scan(&replicaCount, &replicaBytes); err != nil {
 		t.Fatalf("replica count: %v", err)
 	}
-	if primaryCount != replicaCount {
-		t.Fatalf("replica lagging: primary=%d replica=%d", primaryCount, replicaCount)
+	if primaryCount != replicaCount || primaryBytes != replicaBytes {
+		t.Fatalf("replica mismatch at %s: primary rows=%d bytes=%d replica rows=%d bytes=%d", pos.TXID, primaryCount, primaryBytes, replicaCount, replicaBytes)
 	}
+	primaryRows, err := primary.Query("SELECT id,value,updated_at FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := primaryRows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	replicaRows, err := conn.QueryContext(verifyCtx, "SELECT id,value,updated_at FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := replicaRows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	for primaryRows.Next() {
+		var want, got struct {
+			id        int64
+			value     string
+			updatedAt int64
+		}
+		if err := primaryRows.Scan(&want.id, &want.value, &want.updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		if !replicaRows.Next() {
+			t.Fatalf("replica ended before row %d: %v", want.id, replicaRows.Err())
+		}
+		if err := replicaRows.Scan(&got.id, &got.value, &got.updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("replica row mismatch at %s: got=%+v want=%+v", pos.TXID, got, want)
+		}
+	}
+	if err := primaryRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if replicaRows.Next() {
+		t.Fatal("replica has extra rows")
+	}
+	if err := replicaRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return writerOps.Load()
 }
 
 // TestVFS_OverlappingTransactionCommitStorm tests that the VFS can handle
@@ -656,7 +754,6 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 25 * time.Millisecond
 	db, primary := openReplicatedPrimary(t, client, interval, interval)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, account INTEGER, amount INTEGER, created_at INTEGER)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -788,7 +885,6 @@ func TestVFS_CacheMissStorm(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 20 * time.Millisecond
 	_, primary := openReplicatedPrimary(t, client, interval, interval)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE stats (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -831,14 +927,13 @@ func BenchmarkVFS_LargeDatabase(b *testing.B) {
 	}
 	client := file.NewReplicaClient(b.TempDir())
 	db, primary := openReplicatedPrimary(b, client, 25*time.Millisecond, 25*time.Millisecond)
-	b.Cleanup(func() { testingutil.MustCloseSQLDB(b, primary) })
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT, updated_at INTEGER)"); err != nil {
 		b.Fatalf("create table: %v", err)
 	}
 	seedLargeTable(b, primary, 20000)
 	forceReplicaSync(b, db)
-	if err := db.Replica.Stop(false); err != nil {
+	if err := db.Close(context.Background()); err != nil {
 		b.Fatalf("stop replica: %v", err)
 	}
 
@@ -866,7 +961,6 @@ func TestVFS_NetworkLatencySensitivity(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE logs (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -894,7 +988,6 @@ func TestVFS_ConcurrentConnectionScaling(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -962,7 +1055,6 @@ func TestVFS_PRAGMAQueryBehavior(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE configs (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1028,7 +1120,6 @@ func TestVFS_SortingLargeResultSet(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec(`CREATE TABLE t (
 		id INTEGER PRIMARY KEY,
@@ -1040,7 +1131,7 @@ func TestVFS_SortingLargeResultSet(t *testing.T) {
 
 	seedSortedDataset(t, primary, 25000)
 	forceReplicaSync(t, db)
-	if err := db.Replica.Stop(false); err != nil {
+	if err := db.Close(context.Background()); err != nil {
 		t.Fatalf("stop replica: %v", err)
 	}
 
@@ -1072,7 +1163,6 @@ func TestVFS_ConcurrentIndexAccessRaces(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const monitorInterval = 10 * time.Millisecond
 	_, primary := openReplicatedPrimary(t, client, monitorInterval, 10*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT, updated_at INTEGER)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1209,7 +1299,6 @@ func TestVFS_MultiplePageSizes(t *testing.T) {
 		t.Run(fmt.Sprintf("page_%d", pageSize), func(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
 			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond)
-			defer testingutil.MustCloseSQLDB(t, primary)
 
 			if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
 				t.Fatalf("disable wal: %v", err)
@@ -1323,7 +1412,6 @@ func TestVFS_WaitsForInitialSnapshot(t *testing.T) {
 		}
 
 		_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-		defer testingutil.MustCloseSQLDB(t, primary)
 
 		if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
 			t.Fatalf("create table: %v", err)
@@ -1359,7 +1447,6 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
 			db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
-			defer testingutil.MustCloseSQLDB(t, primary)
 
 			if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -1377,7 +1464,7 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 				return itr.Next()
 			}, 5*time.Second, db.MonitorInterval, "LTX files should be created by background monitor")
 			forceReplicaSync(t, db)
-			if err := db.Replica.Stop(false); err != nil {
+			if err := db.Close(context.Background()); err != nil {
 				t.Fatalf("stop replica: %v", err)
 			}
 
@@ -1434,7 +1521,6 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 func TestVFS_PartialLTXUpload(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE logs (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1488,7 +1574,6 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 func TestVFS_S3EventualConsistency(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1514,7 +1599,6 @@ func TestVFS_S3EventualConsistency(t *testing.T) {
 func TestVFS_FileDescriptorBudget(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1604,7 +1688,6 @@ func TestVFS_FileDescriptorBudget(t *testing.T) {
 func TestVFS_PageIndexOOM(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1661,7 +1744,6 @@ func TestVFS_PageIndexOOM(t *testing.T) {
 func TestVFS_PageIndexCorruptionRecovery(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	_, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1708,7 +1790,6 @@ func TestVFS_RapidUpdateCoalescing(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 5 * time.Millisecond
 	_, primary := openReplicatedPrimary(t, client, interval, interval)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value INTEGER)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1780,7 +1861,6 @@ func TestVFS_PollingThreadRecoversFromLTXListFailure(t *testing.T) {
 	flakyClient := &flakyLTXClient{ReplicaClient: client}
 	const monitorInterval = 25 * time.Millisecond
 	_, primary := openReplicatedPrimary(t, client, monitorInterval, monitorInterval)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -1836,7 +1916,6 @@ func TestVFS_PollIntervalEdgeCases(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
 			obs := &observingReplicaClient{ReplicaClient: client}
 			_, primary := openReplicatedPrimary(t, obs, tt.interval, tt.interval)
-			defer testingutil.MustCloseSQLDB(t, primary)
 
 			if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER)"); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -1865,7 +1944,6 @@ func TestVFS_PooledWriteNoFalseConflict(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 
 	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE seed (id INTEGER PRIMARY KEY)"); err != nil {
 		t.Fatalf("create seed table: %v", err)
@@ -1929,7 +2007,6 @@ func TestVFS_PooledWriteStress(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 
 	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -2088,11 +2165,21 @@ func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monit
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = syncInterval
+	// Establish WAL mode before the monitor can open/checkpoint the primary.
+	// Changing journal mode concurrently with monitor startup can return BUSY.
+	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	if err := db.Open(); err != nil {
+		testingutil.MustCloseSQLDB(tb, sqldb)
 		tb.Fatalf("open db: %v", err)
 	}
-	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
-	tb.Cleanup(func() { _ = db.Close(context.Background()) })
+	// The fixture owns both handles. Stop monitoring and flush replication
+	// before closing SQLite, which may remove the WAL on its last close.
+	tb.Cleanup(func() {
+		err := db.Close(context.Background())
+		if err = errors.Join(err, sqldb.Close()); err != nil {
+			tb.Errorf("close replicated primary: %v", err)
+		}
+	})
 	return db, sqldb
 }
 

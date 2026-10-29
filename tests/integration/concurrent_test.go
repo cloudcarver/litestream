@@ -82,7 +82,9 @@ func TestRapidCheckpoints(t *testing.T) {
 	t.Log("Waiting for final sync/compaction cycle...")
 	time.Sleep(45 * time.Second)
 
-	db.StopLitestream()
+	if err := db.StopLitestream(); err != nil {
+		t.Fatalf("stop litestream: %v", err)
+	}
 
 	t.Log("[3] Checking for errors...")
 	errors, err := db.CheckForErrors()
@@ -216,7 +218,9 @@ func TestWALGrowth(t *testing.T) {
 
 	t.Logf("Total database size: %.2f MB", float64(dbSize)/(1024*1024))
 
-	db.StopLitestream()
+	if err := db.StopLitestream(); err != nil {
+		t.Fatalf("stop litestream: %v", err)
+	}
 	time.Sleep(2 * time.Second)
 
 	t.Log("[5] Checking for errors...")
@@ -239,15 +243,19 @@ func TestWALGrowth(t *testing.T) {
 
 	t.Log("✓ Restore successful")
 
-	origCount, err := db.GetRowCount("wal_test")
+	origCount, err := db.GetRowCount("load_test")
 	if err != nil {
 		t.Fatalf("Failed to get original row count: %v", err)
 	}
 
 	restoredDB := &TestDB{Path: restoredPath, t: t}
-	restCount, err := restoredDB.GetRowCount("wal_test")
+	restCount, err := restoredDB.GetRowCount("load_test")
 	if err != nil {
 		t.Fatalf("Failed to get restored row count: %v", err)
+	}
+
+	if origCount == 0 {
+		t.Fatal("load generator produced no rows to verify")
 	}
 
 	if origCount != restCount {
@@ -332,7 +340,9 @@ func TestConcurrentOperations(t *testing.T) {
 
 	t.Log("[4] Stopping all Litestream instances...")
 	for _, db := range dbs {
-		db.StopLitestream()
+		if err := db.StopLitestream(); err != nil {
+			t.Fatalf("stop litestream: %v", err)
+		}
 	}
 
 	time.Sleep(2 * time.Second)
@@ -358,9 +368,18 @@ func TestConcurrentOperations(t *testing.T) {
 			t.Fatalf("Restore failed for database %d: %v", i, err)
 		}
 
-		origCount, _ := db.GetRowCount("test_data")
+		origCount, err := db.GetRowCount("load_test")
+		if err != nil {
+			t.Fatalf("Failed to count original load rows for database %d: %v", i, err)
+		}
+		if origCount == 0 {
+			t.Fatalf("Database %d has no load rows to verify", i)
+		}
 		restoredDB := &TestDB{Path: restoredPath, t: t}
-		restCount, _ := restoredDB.GetRowCount("test_data")
+		restCount, err := restoredDB.GetRowCount("load_test")
+		if err != nil {
+			t.Fatalf("Failed to count restored load rows for database %d: %v", i, err)
+		}
 
 		if origCount != restCount {
 			t.Fatalf("Database %d count mismatch: original=%d, restored=%d", i, origCount, restCount)
@@ -440,7 +459,9 @@ func TestBusyTimeout(t *testing.T) {
 
 	time.Sleep(5 * time.Second)
 
-	db.StopLitestream()
+	if err := db.StopLitestream(); err != nil {
+		t.Fatalf("stop litestream: %v", err)
+	}
 	time.Sleep(2 * time.Second)
 
 	t.Log("[4] Checking for errors...")

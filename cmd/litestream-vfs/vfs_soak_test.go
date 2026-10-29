@@ -15,7 +15,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 // TestVFS_LongRunningSoak exercises the VFS under sustained read/write load.
@@ -38,7 +37,6 @@ func TestVFS_LongRunningSoak(t *testing.T) {
 	vfsName := registerTestVFS(t, vfs)
 
 	db, primary := openReplicatedPrimary(t, client, 75*time.Millisecond, 75*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec(`CREATE TABLE t (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

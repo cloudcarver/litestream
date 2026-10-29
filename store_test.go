@@ -238,23 +238,34 @@ func TestStore_Integration(t *testing.T) {
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
 
+	// Bootstrap WAL/schema before monitors run. A timer is not evidence that the
+	// first non-empty backup has been published.
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+INSERT INTO t (val) VALUES ('initial');`); err != nil {
+		t.Fatal(err)
+	}
+
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
 		{Level: 1, Interval: factor * 200 * time.Millisecond},
 		{Level: 2, Interval: factor * 500 * time.Millisecond},
 	})
-	store.SnapshotInterval = factor * 1 * time.Second
+	store.SnapshotInterval = factor * time.Second
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close(t.Context())
-
-	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
-	defer testingutil.MustCloseSQLDB(t, sqldb)
-
-	// Create initial table
-	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
-		t.Fatal(err)
+	defer func() {
+		if err := store.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	bootstrap, cancelBootstrap := context.WithTimeout(t.Context(), 5*time.Second)
+	err := db.SyncAndWait(bootstrap)
+	cancelBootstrap()
+	if err != nil {
+		t.Fatalf("publish initial backup: %v", err)
 	}
 
 	// Run test for a fixed duration.
@@ -294,21 +305,17 @@ func TestStore_Integration(t *testing.T) {
 				return
 			case <-ticker.C:
 				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (val) VALUES (?);`, time.Now().String()); err != nil {
-					// Check if we're shutting down
-					select {
-					case <-done:
-						// Expected during shutdown, just exit
-						return
-					default:
-						// Real error, send it
-						select {
-						case insertErr <- err:
-						default:
-						}
-						return
-					}
+					insertErr <- err
+					return
 				}
 			}
+		}
+	}()
+
+	maxRestoredCount := 0
+	defer func() {
+		if maxRestoredCount <= 1 {
+			t.Error("automatic replication never published writes after bootstrap")
 		}
 	}()
 
@@ -348,6 +355,7 @@ func TestStore_Integration(t *testing.T) {
 				} else if count == 0 {
 					t.Fatal("no records found in restored database")
 				}
+				maxRestoredCount = max(maxRestoredCount, count)
 				t.Logf("restored database: %d records", count)
 			}()
 		}

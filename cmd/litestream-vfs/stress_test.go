@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestVFS_RaceStressHarness(t *testing.T) {
@@ -26,7 +25,6 @@ func TestVFS_RaceStressHarness(t *testing.T) {
 
 	client := file.NewReplicaClient(t.TempDir())
 	db, primary := openReplicatedPrimary(t, client, 20*time.Millisecond, 20*time.Millisecond)
-	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE stress (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)

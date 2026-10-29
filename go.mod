@@ -4,6 +4,9 @@ go 1.26.0
 
 toolchain go1.26.8
 
+// Do not register SQLite close callbacks when xOpen did not acquire a file.
+replace github.com/psanford/sqlite3vfs => ./third_party/sqlite3vfs
+
 require (
 	cloud.google.com/go/storage v1.56.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.2
