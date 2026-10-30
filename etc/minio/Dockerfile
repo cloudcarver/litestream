@@ -8,7 +8,7 @@
 # Integration tests and CI expect it tagged as:
 #   litestream-minio:RELEASE.2025-09-07T16-13-09Z
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
 
 # RELEASE.2025-09-07T16-13-09Z
 ARG MINIO_COMMIT=01ce918d8279a20e4706b96a64396146894adee4

@@ -89,7 +89,7 @@ Your PR should:
 
 ### Prerequisites
 
-- Go 1.24 or later
+- Go 1.27.3 or later
 - CGO enabled (for SQLite integration)
 - Git
 - Pre-commit (optional but recommended): `pip install pre-commit`

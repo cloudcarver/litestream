@@ -1,8 +1,6 @@
 module github.com/benbjohnson/litestream
 
-go 1.26.0
-
-toolchain go1.26.8
+go 1.27.3
 
 // Do not register SQLite close callbacks when xOpen did not acquire a file.
 replace github.com/psanford/sqlite3vfs => ./third_party/sqlite3vfs
