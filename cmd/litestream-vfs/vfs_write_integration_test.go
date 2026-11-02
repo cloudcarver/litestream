@@ -52,8 +52,9 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Close(context.Background()))
 	testingutil.MustCloseSQLDB(t, sqldb0)
+	// DB.Close joins the DB monitor before stopping the replica it owns.
+	require.NoError(t, db.Close(context.Background()))
 
 	// Now open via writable VFS and add more data
 	vfs := newWritableVFS(t, client, 1*time.Second, t.TempDir())
@@ -952,8 +953,9 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Close(context.Background()))
 	testingutil.MustCloseSQLDB(t, sqldb0)
+	// DB.Close joins the DB monitor before stopping the replica it owns.
+	require.NoError(t, db.Close(context.Background()))
 
 	// Open via VFS (should work with same page size)
 	vfs := newWritableVFS(t, client, 1*time.Second, t.TempDir())
@@ -1266,8 +1268,8 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	require.NoError(t, db.Sync(context.Background()))
 	require.NoError(t, db.Replica.Sync(context.Background()))
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
+	// DB.Close joins the DB monitor before stopping the replica it owns.
 	require.NoError(t, db.Close(context.Background()))
 }
 

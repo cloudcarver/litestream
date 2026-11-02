@@ -87,8 +87,39 @@ func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, useMetad
 // If the fetch was smaller than the actual page index, another call is made to fetch the rest.
 const DefaultEstimatedPageIndexSize = 32 * 1024 // 32KB
 
+// PageIndexClient serves an authoritative immutable index independently of the
+// object body. Wrappers must preserve this optional capability and cancellation.
+type PageIndexClient interface {
+	OpenPageIndex(context.Context, *ltx.FileInfo) (io.ReadCloser, error)
+}
+
+// PageIndexLookup resolves one page in an immutable, protected file view.
+// A false result means known absence. An unloaded/failed block is never absence.
+type PageIndexLookup interface {
+	Lookup(context.Context, uint32) (ltx.PageIndexElem, bool, error)
+}
+
+type PageIndexLookupClient interface {
+	OpenPageIndexLookup(context.Context, *ltx.FileInfo) (PageIndexLookup, error)
+}
+
+// A nil lookup requests the compatible eager path (legacy or tiny indexes).
+func OpenPageIndexLookup(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (PageIndexLookup, error) {
+	if c, ok := client.(PageIndexLookupClient); ok {
+		return c.OpenPageIndexLookup(ctx, info)
+	}
+	return nil, nil
+}
+
+func OpenPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (io.ReadCloser, error) {
+	if c, ok := client.(PageIndexClient); ok {
+		return c.OpenPageIndex(ctx, info)
+	}
+	return FetchPageIndexData(ctx, client, info)
+}
+
 func FetchPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
-	rc, err := fetchPageIndexData(ctx, client, info)
+	rc, err := OpenPageIndex(ctx, client, info)
 	if err != nil {
 		return nil, err
 	}
@@ -111,9 +142,9 @@ func FetchLTXHeader(ctx context.Context, client ReplicaClient, info *ltx.FileInf
 	return hdr, nil
 }
 
-// fetchPageIndexData fetches a chunk of the end of the file to get the page index.
+// FetchPageIndexData fetches a chunk of the end of the file to get the page index.
 // If the fetch was smaller than the actual page index, another call is made to fetch the rest.
-func fetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (io.ReadCloser, error) {
+func FetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (io.ReadCloser, error) {
 	// Fetch the end of the file to get the page index.
 	offset := info.Size - DefaultEstimatedPageIndexSize
 	if offset < 0 {
