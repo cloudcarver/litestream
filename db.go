@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -79,6 +80,11 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	// Snapshots hold chkMu until their encoder exits. Admission is serialized
+	// by execSem; Close cancels them and drains chkMu before releasing handles.
+	snapshotSeq     uint64 // protected by execSem
+	activeSnapshots atomic.Int64
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -105,6 +111,7 @@ type DB struct {
 	Done   <-chan struct{}
 
 	// Metrics
+	metricsRegistered           bool
 	dbSizeGauge                 prometheus.Gauge
 	walSizeGauge                prometheus.Gauge
 	totalWALBytesCounter        prometheus.Counter
@@ -328,25 +335,13 @@ func NewDB(path string) *DB {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
 
-	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
-	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
-	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
-	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
-	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
-	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
-	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
-	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
-	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
-	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+	db.initMetrics()
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -360,6 +355,70 @@ func NewDB(path string) *DB {
 	}
 
 	return db
+}
+
+// initMetrics creates the per-database Prometheus series.
+// Open calls it again because Close deletes them.
+func (db *DB) initMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = true
+	dbMetricOwners.paths[db.path]++
+	dbMetricOwners.basenames[filepath.Base(db.path)]++
+
+	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
+	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
+	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
+	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
+	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
+	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
+	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
+	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+}
+
+// deleteMetrics removes every per-database series so a process that opens many
+// databases over its lifetime does not accumulate series forever.
+func (db *DB) deleteMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if !db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = false
+
+	name := filepath.Base(db.path)
+	dbMetricOwners.basenames[name]--
+	if dbMetricOwners.basenames[name] == 0 {
+		delete(dbMetricOwners.basenames, name)
+		internal.L0RetentionGaugeVec.DeletePartialMatch(prometheus.Labels{"db": name})
+	}
+
+	dbMetricOwners.paths[db.path]--
+	if dbMetricOwners.paths[db.path] != 0 {
+		return
+	}
+	delete(dbMetricOwners.paths, db.path)
+
+	labels := prometheus.Labels{"db": db.path}
+	dbSizeGaugeVec.DeletePartialMatch(labels)
+	walSizeGaugeVec.DeletePartialMatch(labels)
+	totalWALBytesCounterVec.DeletePartialMatch(labels)
+	txIDIndexGaugeVec.DeletePartialMatch(labels)
+	syncNCounterVec.DeletePartialMatch(labels)
+	syncErrorNCounterVec.DeletePartialMatch(labels)
+	syncSecondsCounterVec.DeletePartialMatch(labels)
+	diskFullGaugeVec.DeletePartialMatch(labels)
+	compactionVerifyErrorCounterVec.DeletePartialMatch(labels)
+	checkpointNCounterVec.DeletePartialMatch(labels)
+	checkpointErrorNCounterVec.DeletePartialMatch(labels)
+	checkpointSecondsCounterVec.DeletePartialMatch(labels)
 }
 
 // SetLogger updates the database logger and propagates to subsystems.
@@ -777,6 +836,9 @@ func (db *DB) Open() (err error) {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.mu.Unlock()
 
+	// Close deletes the per-database series, so recreate them.
+	db.initMetrics()
+
 	// Validate fields on database.
 	if db.Replica == nil {
 		return fmt.Errorf("replica required before opening database")
@@ -816,6 +878,12 @@ func (db *DB) Open() (err error) {
 // and closes the database. If Done is set, closing it interrupts the shutdown
 // sync retry loop and cancels any in-flight sync attempt.
 func (db *DB) Close(ctx context.Context) (err error) {
+	startedAt := time.Now()
+	logger := db.Logger.With("path", db.path)
+	logger.Debug("db close", "phase", "cancel", "active_snapshots", db.activeSnapshots.Load())
+	defer func() {
+		logger.Debug("db close", "phase", "finished", "elapsed", time.Since(startedAt), "error", err)
+	}()
 	db.cancel()
 	db.wg.Wait()
 
@@ -829,6 +897,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	}
 	defer db.execSem.Release(1)
 
+	// No new snapshot can be admitted while execSem is held. Cancellation
+	// unblocks pipe writes even when the caller has abandoned the reader.
+	// The checkpoint lock is released only after each encoder has exited.
+	logger.Debug("db close", "phase", "wait_snapshots", "active_snapshots", db.activeSnapshots.Load())
+	db.chkMu.Lock()
+	logger.Debug("db close", "phase", "snapshots_stopped", "active_snapshots", db.activeSnapshots.Load())
+	db.chkMu.Unlock()
+
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
 		if _, e := db.syncLocked(ctx, 0); e != nil {
@@ -839,8 +915,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	// Ensure replicas perform a final sync and stop replicating.
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
-				err = e
+			if e := db.syncReplicaWithRetry(ctx); e != nil {
+				if err == nil {
+					err = e
+				} else if errors.Is(e, ErrShutdownInterrupted) {
+					logger.Warn("shutdown sync interrupted after another close error", "error", e)
+				} else {
+					logger.Error("shutdown sync failed after another close error", "error", e)
+				}
 			}
 		}
 		db.Replica.Stop(true)
@@ -848,8 +930,12 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Release the read lock to allow other applications to handle checkpointing.
 	if db.rtx != nil {
-		if e := db.releaseReadLock(); e != nil && err == nil {
-			err = e
+		if e := db.releaseReadLock(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("release read lock failed after another close error", "error", e)
+			}
 		}
 	}
 
@@ -863,16 +949,29 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.mu.Unlock()
 
 	if sqlDB != nil {
-		if e := sqlDB.Close(); e != nil && err == nil {
-			err = e
+		if e := sqlDB.Close(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("close SQL handle failed after another close error", "error", e)
+			}
 		}
 	}
 
 	if f != nil {
-		if e := f.Close(); e != nil && err == nil {
-			err = e
+		if e := f.Close(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				logger.Error("close database file failed after another close error", "error", e)
+			}
 		}
 	}
+	logger.Debug("db close", "phase", "files_closed", "error", err)
+
+	// Remove this database's series now that the final sync has recorded
+	// its last values.
+	db.deleteMetrics()
 
 	return err
 }
@@ -1186,8 +1285,11 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 		return nil
 	}
 
-	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.BeginTx(ctx, nil)
+	// Start long running read-transaction to prevent checkpoints. The
+	// transaction outlives this call, and database/sql rolls it back when its
+	// BeginTx context is cancelled, so detach it from the caller's context
+	// (e.g. a control socket request that is cancelled when it returns).
+	tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
@@ -1257,6 +1359,14 @@ func (db *DB) lockExec(ctx context.Context) error {
 	return nil
 }
 
+// addDurationToCounter records positive durations without allowing a clock
+// adjustment to panic a Prometheus counter.
+func addDurationToCounter(counter prometheus.Counter, d time.Duration) {
+	if d > 0 {
+		counter.Add(d.Seconds())
+	}
+}
+
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
@@ -1273,7 +1383,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		} else {
 			db.diskFullGauge.Set(0)
 		}
-		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.syncSecondsCounter, time.Since(t))
 	}()
 
 	exec, err := db.newSyncExecutor(ctx)
@@ -1793,6 +1903,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
+		// A snapshot must hold every frame not yet in the database file,
+		// including those before the stale offset.
+		info.offset = WALHeaderSize
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
@@ -2657,7 +2770,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 		if err != nil {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
-		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.checkpointSecondsCounterVec.With(labels), time.Since(t))
 	}()
 
 	// Ensure the read lock has been removed before issuing a checkpoint.
@@ -2690,31 +2803,38 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 }
 
 type snapshotReadPosition struct {
+	id           uint64
 	pos          ltx.Pos
 	pageSize     int
 	walEndOffset int64
 	db           *DB
-	closeOnce    sync.Once
+	dbCtx        context.Context
 }
 
 func (p *snapshotReadPosition) close() {
-	p.closeOnce.Do(func() { p.db.chkMu.RUnlock() })
+	p.db.activeSnapshots.Add(-1)
+	p.db.chkMu.RUnlock()
 }
 
 type snapshotReadCloser struct {
 	*io.PipeReader
-	pos *snapshotReadPosition
+	cancel context.CancelCauseFunc
+	done   <-chan struct{}
 }
 
 func (r *snapshotReadCloser) Close() error {
-	defer r.pos.close()
-	return r.PipeReader.Close()
+	r.cancel(io.ErrClosedPipe)
+	err := r.PipeReader.Close()
+	<-r.done
+	return err
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 // Internal checkpoints remain disabled until the reader reaches EOF or is
 // closed. Callers must close readers they do not fully consume; abandoning a
-// reader blocks checkpoints indefinitely.
+// reader blocks checkpoints until its context is canceled or the DB is closed.
+// Closing the DB cancels active readers with os.ErrClosed and waits for their
+// encoders before releasing database files. Closing a reader also joins its encoder.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
@@ -2730,10 +2850,20 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error
 }
 
 func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	if err := db.lockExec(ctx); err != nil {
 		return nil, err
 	}
 	defer db.execSem.Release(1)
+
+	db.mu.RLock()
+	dbCtx := db.ctx
+	db.mu.RUnlock()
+	if dbCtx.Err() != nil {
+		return nil, os.ErrClosed
+	}
 
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
@@ -2760,11 +2890,15 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	// checkpoint can run between capturing pos and locking chkMu — the
 	// snapshot always matches the advertised position.
 	db.chkMu.RLock()
+	db.snapshotSeq++
+	db.activeSnapshots.Add(1)
 	return &snapshotReadPosition{
+		id:           db.snapshotSeq,
 		pos:          pos,
 		pageSize:     pageSize,
 		walEndOffset: walEndOffset,
 		db:           db,
+		dbCtx:        dbCtx,
 	}, nil
 }
 
@@ -2810,100 +2944,120 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 }
 
 func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.ReadCloser, error) {
-	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
+	startedAt := time.Now()
+	logger := db.Logger.With("path", db.path, "snapshot_id", pos.id, "txid", pos.pos.TXID.String())
+	logger.Debug("snapshot started", "wal_end_offset", pos.walEndOffset, "active_snapshots", db.activeSnapshots.Load())
 
-	// TODO(ltx): Read database size from database header.
-
+	// pos holds chkMu, so Close cannot release this file during setup.
 	fi, err := db.f.Stat()
 	if err != nil {
+		logger.Debug("snapshot finished", "elapsed", time.Since(startedAt), "error", err)
 		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(pos.pageSize))
 
-	// Execute encoding in a separate goroutine so the caller can initialize before reading.
+	ctx, cancel := context.WithCancelCause(ctx)
+	stopDBCancel := context.AfterFunc(pos.dbCtx, func() { cancel(os.ErrClosed) })
 	pr, pw := io.Pipe()
+	// A canceled reader must interrupt a producer blocked in PipeWriter.Write,
+	// including when no consumer ever reads from the pipe.
+	stopPipeCancel := context.AfterFunc(ctx, func() {
+		if err := pw.CloseWithError(context.Cause(ctx)); err != nil {
+			logger.Error("cancel snapshot pipe", "error", err)
+		}
+	})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer pos.close()
+		defer cancel(nil)
+		defer stopDBCancel()
+		defer stopPipeCancel()
 
-		walFile, err := os.Open(db.WALPath())
-		if err != nil {
-			pw.CloseWithError(err)
-			return
+		err := db.encodeSnapshot(ctx, pw, pos, commit)
+		cause := context.Cause(ctx)
+		if closeErr := pw.CloseWithError(err); closeErr != nil {
+			logger.Error("close snapshot pipe", "error", closeErr)
 		}
-		defer walFile.Close()
-
-		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
-			return
-		}
-
-		// Build a mapping of changed page numbers and their latest content.
-		maxBytes := pos.walEndOffset - WALHeaderSize
-		pageMap := make(map[uint32]int64)
-		var maxOffset int64
-		var walCommit uint32
-		if maxBytes > 0 {
-			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
-			if err != nil {
-				pw.CloseWithError(fmt.Errorf("page map: %w", err))
-				return
-			}
-		}
-		if walCommit > 0 {
-			commit = walCommit
-		}
-
-		if maxOffset > pos.walEndOffset {
-			pw.CloseWithError(fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset))
-			return
-		}
-		walOffset, walSize := snapshotHeaderWALRange(maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
-
-		db.Logger.Debug("encode snapshot header",
-			"txid", pos.pos.TXID.String(),
-			"commit", commit,
-			"walOffset", walOffset,
-			"walSize", walSize,
-			"walEndOffset", pos.walEndOffset,
-			"salt1", rd.salt1,
-			"salt2", rd.salt2)
-
-		enc, err := ltx.NewEncoder(pw)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
-			return
-		}
-		if err := enc.EncodeHeader(ltx.Header{
-			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(pos.pageSize),
-			Commit:    commit,
-			MinTXID:   1,
-			MaxTXID:   pos.pos.TXID,
-			Timestamp: time.Now().UnixMilli(),
-			WALOffset: walOffset,
-			WALSize:   walSize,
-			WALSalt1:  rd.salt1,
-			WALSalt2:  rd.salt2,
-		}); err != nil {
-			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
-			return
-		}
-
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
-			return
-		}
-
-		if err := enc.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
-			return
-		}
-		_ = pw.Close()
+		logger.Debug("snapshot finished", "elapsed", time.Since(startedAt),
+			"error", err, "cancel_cause", cause)
 	}()
 
-	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
+	return &snapshotReadCloser{PipeReader: pr, cancel: cancel, done: done}, nil
+}
+
+func (db *DB) encodeSnapshot(ctx context.Context, w io.Writer, pos *snapshotReadPosition, commit uint32) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, walFile.Close()) }()
+
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
+	if err != nil {
+		return fmt.Errorf("new wal reader: %w", err)
+	}
+
+	// Build a mapping of changed page numbers and their latest content.
+	maxBytes := pos.walEndOffset - WALHeaderSize
+	pageMap := make(map[uint32]int64)
+	var maxOffset int64
+	var walCommit uint32
+	if maxBytes > 0 {
+		pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+		if err != nil {
+			return fmt.Errorf("page map: %w", err)
+		}
+	}
+	if walCommit > 0 {
+		commit = walCommit
+	}
+
+	if maxOffset > pos.walEndOffset {
+		return fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset)
+	}
+	walOffset, walSize := snapshotHeaderWALRange(maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
+
+	db.Logger.Debug("encode snapshot header",
+		"snapshot_id", pos.id,
+		"txid", pos.pos.TXID.String(),
+		"commit", commit,
+		"walOffset", walOffset,
+		"walSize", walSize,
+		"walEndOffset", pos.walEndOffset,
+		"salt1", rd.salt1,
+		"salt2", rd.salt2)
+
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(pos.pageSize),
+		Commit:    commit,
+		MinTXID:   1,
+		MaxTXID:   pos.pos.TXID,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: walOffset,
+		WALSize:   walSize,
+		WALSalt1:  rd.salt1,
+		WALSalt2:  rd.salt2,
+	}); err != nil {
+		return fmt.Errorf("encode ltx snapshot header: %w", err)
+	}
+
+	if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		return fmt.Errorf("write snapshot ltx: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("close ltx snapshot encoder: %w", err)
+	}
+	return nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
@@ -2927,7 +3081,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
 		}
@@ -2940,12 +3094,12 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 // It always writes, even when a snapshot already exists at the current
 // position, so operators can force a re-upload (replicate -force-snapshot).
 // Callers that want to skip duplicates check first, as Store.CompactDB does.
-func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+func (db *DB) Snapshot(ctx context.Context) (_ *ltx.FileInfo, err error) {
 	pos, r, err := db.SnapshotReader(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.Close() }()
+	defer func() { err = errors.Join(err, r.Close()) }()
 
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
@@ -3192,7 +3346,7 @@ func (db *DB) monitor() {
 		// end so checkpointIfNeeded() runs. A single bounded chunk per
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
-		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := db.Sync(db.ctx); err != nil && !isShutdownError(db.ctx, err) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
@@ -3356,6 +3510,15 @@ func NewRestoreOptions() RestoreOptions {
 
 // Database metrics.
 var (
+	dbMetricOwners = struct {
+		sync.Mutex
+		paths     map[string]int
+		basenames map[string]int
+	}{
+		paths:     make(map[string]int),
+		basenames: make(map[string]int),
+	}
+
 	dbSizeGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "litestream_db_size",
 		Help: "The current size of the real DB",

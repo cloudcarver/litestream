@@ -271,7 +271,7 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
 	testingutil.MustCloseSQLDB(t, sqldb)
-	// Close the owning DB so its monitor stops before the replica is stopped.
+	// DB.Close joins the DB monitor before stopping the replica it owns.
 	require.NoError(t, db.Close(context.Background()))
 }
 
@@ -303,6 +303,6 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
 	testingutil.MustCloseSQLDB(t, sqldb)
-	// Close the owning DB so its monitor stops before the replica is stopped.
+	// DB.Close joins the DB monitor before stopping the replica it owns.
 	require.NoError(t, db.Close(context.Background()))
 }

@@ -267,6 +267,32 @@ go test -race -v -run TestDB_Sync ./...
 go test -race -v -run TestStore_CompactDB ./...
 ```
 
+### Snapshot shutdown regressions
+
+`db_snapshot_lifecycle_test.go` gates the encoder immediately before a database
+page read, then starts DB or Store shutdown. It verifies cancellation and that
+the file and checkpoint lock remain owned until the encoder exits. It also
+covers abandoned readers, caller cancellation, early reader closure, and reopen.
+The gates use channels; timeouts only bound a failed test, not the interleaving.
+
+```bash
+go test -race -count=10 -cpu=1,4 -timeout=2m \
+  -run '^(TestDB_CloseWaitsForSnapshotEncoder|TestDB_SnapshotReaderCancellation|TestSnapshotReadCloser_JoinsEncoder|TestDB_SnapshotReaderAfterCloseAndReopen|TestStore_CloseStopsSnapshotsBeforeClosingDB)$' .
+```
+
+With debug logging enabled, correlate `snapshot started` / `snapshot finished`
+by `path`, `snapshot_id`, and `txid`. Completion includes `elapsed`, `error`, and
+`cancel_cause`. DB close logs the cancellation, snapshot wait, snapshot drain,
+file release, and completion phases, with `active_snapshots` at the wait boundary.
+Store close logs when its monitors have stopped before closing its databases.
+
+Nightly's `race-diagnostics-<attempt>` artifact retains the full verbose race
+output and commit/toolchain/platform metadata for 14 days. The failure summary
+preserves both conflicting access stacks before calling the Issues API. If issue
+creation fails (including HTTP 410 on forks with Issues disabled), the notifier
+still fails visibly, and its summary and the race artifact remain available.
+No external notification channel is configured by this fallback.
+
 ### Common Race Conditions
 
 #### 1. Position Updates
