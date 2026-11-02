@@ -612,21 +612,26 @@ type VFSFile struct {
 	client     ReplicaClient
 	name       string
 
-	pos              ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1         ltx.TXID // Last TXID read from level 1
-	index            map[uint32]ltx.PageIndexElem
-	pending          map[uint32]ltx.PageIndexElem
-	pendingReplace   bool
-	pendingCommit    uint32 // Size belonging to the pending reader snapshot.
-	pendingCommitSet bool
-	cache            *lru.Cache[uint32, []byte] // LRU cache for page data
-	targetTime       *time.Time                 // Target view time; nil means latest
-	latestLTXTime    time.Time                  // Timestamp of most recent LTX file
-	lastPollSuccess  time.Time                  // Time of last successful poll
-	pollWake         chan struct{}              // Local commits reset idle backoff.
-	lockType         sqlite3vfs.LockType        // Current lock state
-	pageSize         uint32
-	commit           uint32
+	pos                 ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1            ltx.TXID // Last TXID read from level 1
+	index               map[uint32]ltx.PageIndexElem
+	indexBase           PageIndexLookup // Immutable bootstrap view; index holds newer local deltas.
+	indexBaseLimit      uint32          // Lowest truncation since bootstrap, even after expansion.
+	indexBaseTXID       ltx.TXID
+	pendingBaseLimit    uint32
+	pendingBaseLimitSet bool
+	pending             map[uint32]ltx.PageIndexElem
+	pendingReplace      bool
+	pendingCommit       uint32 // Size belonging to the pending reader snapshot.
+	pendingCommitSet    bool
+	cache               *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime          *time.Time                 // Target view time; nil means latest
+	latestLTXTime       time.Time                  // Timestamp of most recent LTX file
+	lastPollSuccess     time.Time                  // Time of last successful poll
+	pollWake            chan struct{}              // Local commits reset idle backoff.
+	lockType            sqlite3vfs.LockType        // Current lock state
+	pageSize            uint32
+	commit              uint32
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
@@ -1319,7 +1324,7 @@ func (f *VFSFile) ResetTime(ctx context.Context) error {
 
 // rebuildIndex constructs a fresh page index and swaps it into the VFSFile.
 func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, target *time.Time) error {
-	index, commit, err := f.buildIndexMap(ctx, infos)
+	index, base, commit, err := f.buildIndexState(ctx, infos)
 	if err != nil {
 		return err
 	}
@@ -1338,6 +1343,8 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.index = index
+	f.indexBase, f.indexBaseLimit, f.indexBaseTXID = base, commit, pos.TXID
+	f.pendingBaseLimitSet = false
 	f.commit = commit
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
@@ -1609,8 +1616,16 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	// Get page index element
 	f.mu.Lock()
 	elem, ok := f.index[pgno]
+	base, baseLimit := f.indexBase, f.indexBaseLimit
 	writeEnabled := f.writeEnabled // capture while holding lock to avoid data race
 	f.mu.Unlock()
+	if !ok {
+		var err error
+		elem, ok, err = lookupIndexBase(f.ctx, base, baseLimit, pgno)
+		if err != nil {
+			return 0, fmt.Errorf("lookup page index: %w", err)
+		}
+	}
 
 	if !ok {
 		// For write-enabled VFS with a new database (no existing pages),
@@ -1739,7 +1754,10 @@ func (f *VFSFile) readPageForWrite(pgno uint32, buf []byte) error {
 	}
 
 	// Get page index element
-	elem, ok := f.index[pgno]
+	elem, ok, err := f.lookupIndexLocked(f.ctx, pgno)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		// New pages (including holes below a previously extended EOF) have no
 		// remote version. Actual remote read failures below must propagate.
@@ -1777,6 +1795,12 @@ func (f *VFSFile) Truncate(size int64) error {
 	// If write support is not enabled, return read-only error
 	if !f.writeEnabled {
 		return sqlite3vfs.ReadOnlyError
+	}
+	f.indexBaseLimit = min(f.indexBaseLimit, newCommit)
+	for _, pgno := range f.cache.Keys() {
+		if pgno > newCommit {
+			f.cache.Remove(pgno)
+		}
 	}
 
 	// Remove dirty pages beyond new size
@@ -2445,6 +2469,10 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+	if f.pendingBaseLimitSet {
+		f.indexBaseLimit = f.pendingBaseLimit
+		f.pendingBaseLimitSet = false
+	}
 	if f.pendingCommitSet && !f.hasDirtyWrites() {
 		f.commit = f.pendingCommit
 	}
@@ -2791,6 +2819,21 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.pendingReplace = true
 	}
 	for _, trunc := range truncations {
+		if f.indexBase != nil {
+			if locked {
+				if !f.pendingBaseLimitSet {
+					f.pendingBaseLimit = f.indexBaseLimit
+				}
+				f.pendingBaseLimit, f.pendingBaseLimitSet = min(f.pendingBaseLimit, trunc.commit), true
+			} else {
+				f.indexBaseLimit = min(f.indexBaseLimit, trunc.commit)
+				for _, pgno := range f.cache.Keys() {
+					if elem, known := target[pgno]; pgno > trunc.commit && (!known || elem.MaxTXID <= trunc.txid) {
+						f.cache.Remove(pgno)
+					}
+				}
+			}
+		}
 		for pgno, elem := range target {
 			if pgno > trunc.commit && elem.MaxTXID <= trunc.txid {
 				delete(target, pgno)
@@ -2865,7 +2908,7 @@ func (f *VFSFile) RefreshIndex(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("refresh restore plan: %w", err)
 	}
-	index, commit, err := f.buildIndexMap(ctx, infos)
+	index, base, commit, err := f.buildIndexState(ctx, infos)
 	if err != nil {
 		return fmt.Errorf("refresh page index: %w", err)
 	}
@@ -2885,6 +2928,12 @@ func (f *VFSFile) RefreshIndex(ctx context.Context) error {
 		return fmt.Errorf("refresh changed database size at the same TXID")
 	}
 	for _, pgno := range f.cache.Keys() {
+		if base != nil || f.indexBase != nil {
+			if head != f.pos.TXID {
+				f.cache.Remove(pgno)
+			}
+			continue
+		}
 		next, exists := index[pgno]
 		old, known := f.index[pgno]
 		// At the same database TXID compaction changes only locations, even
@@ -2894,6 +2943,8 @@ func (f *VFSFile) RefreshIndex(ctx context.Context) error {
 		}
 	}
 	f.index = index
+	f.indexBase, f.indexBaseLimit, f.indexBaseTXID = base, commit, head
+	f.pendingBaseLimitSet = false
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace, f.pendingCommitSet = false, false
 	f.commit, f.pos.TXID = commit, head
@@ -2908,6 +2959,11 @@ func (f *VFSFile) RefreshIndex(ctx context.Context) error {
 // hot pages; older entries, including pending entries overtaken by sync, are ignored.
 func (f *VFSFile) mergeIndexEntries(target, updates map[uint32]ltx.PageIndexElem, invalidate bool) {
 	for pgno, elem := range updates {
+		// The immutable base already represents this transaction or a newer
+		// one. Older compactions cannot replace it without a reference refresh.
+		if f.indexBase != nil && elem.MaxTXID <= f.indexBaseTXID {
+			continue
+		}
 		prev, ok := target[pgno]
 		if !invalidate && !f.pendingReplace {
 			if current, exists := f.index[pgno]; exists && (!ok || current.MaxTXID > prev.MaxTXID) {
@@ -3223,11 +3279,15 @@ func (f *VFSFile) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	pageSize := f.pageSize
 	commit := f.commit
 	pos := f.pos
+	base, baseLimit := f.indexBase, min(f.commit, f.indexBaseLimit)
 	pages := make(map[uint32]ltx.PageIndexElem, len(f.index))
 	for pgno, elem := range f.index {
 		pages[pgno] = elem
 	}
 	f.mu.Unlock()
+	if err := fillSnapshotIndex(ctx, pages, base, baseLimit, pageSize); err != nil {
+		return nil, err
+	}
 
 	if pageSize == 0 {
 		f.logger.Debug("snapshot skipped, page size not initialized", "pageSize", 0)
