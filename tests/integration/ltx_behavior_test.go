@@ -46,6 +46,29 @@ func TestLTXBehavior(t *testing.T) {
 	}
 }
 
+// The two-minute short suite can produce too few L3 files for its timing
+// assertion. Keep the same burst workload and intervals, but observe enough
+// real compactions to reject any extra steady-state invocation near a boundary.
+func TestLTXCompactionScheduleBurst(t *testing.T) {
+	RequireBinaries(t)
+	profile := ShortBurstVolumeProfile()
+	intervals := ProfileCompactionIntervals(true)
+	report := runProfileBehaviorTest(t, profile, 5*time.Minute, ProfileSnapshotInterval(true), intervals, true)
+	observed := report.CompactionIntervals[3]
+	if report.CompactionCounts[3] < 4 || len(observed) < 3 {
+		t.Fatalf("insufficient L3 compaction evidence: %d compactions, %v intervals", report.CompactionCounts[3], observed)
+	}
+	minimum := time.Duration(float64(intervals[3]) * (1 - profile.CompactionSlack))
+	// Startup performs an immediate pass before joining the wall-clock schedule,
+	// so its first interval can be partial. All later passes must respect it.
+	for i, interval := range observed[1:] {
+		if interval < minimum {
+			t.Errorf("L3 steady-state interval %d was %s, below %s: %v", i+1, interval, minimum, observed)
+		}
+	}
+	t.Logf("SCHEDULE_BURST_PROOF level=3 compactions=%d steady_intervals=%v", report.CompactionCounts[3], observed[1:])
+}
+
 // TestLTXBehavior_NoExcessiveSnapshots is a focused test for the specific bug
 // where checkpoints trigger unwanted full snapshots. It runs at moderate write
 // rate and forces checkpoints via WAL growth, then asserts no unexpected snapshots.
@@ -90,7 +113,7 @@ func TestLTXBehavior_NoExcessiveSnapshots(t *testing.T) {
 	runProfileBehaviorTest(t, profile, duration, snapshotInterval, compactionIntervals, shortMode)
 }
 
-func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapshotInterval time.Duration, compactionIntervals map[int]time.Duration, shortMode bool) {
+func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapshotInterval time.Duration, compactionIntervals map[int]time.Duration, shortMode bool) *LTXBehaviorReport {
 	t.Helper()
 
 	t.Logf("--- Profile: %s ---", profile.Name)
@@ -308,6 +331,7 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	t.Log("")
 	t.Logf("Profile %s completed in %v", profile.Name, actualDuration.Round(time.Second))
 	t.Log("================================================")
+	return report
 }
 
 func modeString(shortMode bool) string {

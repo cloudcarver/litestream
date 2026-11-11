@@ -601,9 +601,6 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			// proceed
 		}
 
-		now := time.Now()
-		nextDelay := time.Until(lvl.NextCompactionAt(now))
-
 		var notReadyDBs []string
 
 		for _, db := range s.DBs() {
@@ -628,6 +625,10 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			}
 		}
 
+		// Compaction can cross one or more scheduling boundaries. Calculate
+		// the next delay after the work so it targets a future boundary.
+		now := time.Now()
+		nextDelay := lvl.NextCompactionAt(now).Sub(now)
 		timedOut := !retryDeadline.IsZero() && now.After(retryDeadline)
 		if len(notReadyDBs) > 0 && !timedOut {
 			if retryDeadline.IsZero() {
