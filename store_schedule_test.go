@@ -2,7 +2,6 @@ package litestream
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"testing"
 	"testing/synctest"
@@ -11,67 +10,99 @@ import (
 	"github.com/superfly/ltx"
 )
 
-type compactionPassHandler struct {
-	slog.Handler
-	work     time.Duration
-	attempts chan time.Time
-	first    bool
-}
-
-func (h *compactionPassHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Message == "no compaction" {
-		h.attempts <- time.Now()
-		if h.first {
-			h.first = false
-			// Virtual time models work done by the monitor's first pass.
-			time.Sleep(h.work)
-		}
-	}
-	return h.Handler.Handle(ctx, r)
-}
-
-func TestStoreCompactionMonitorSchedulesAfterPass(t *testing.T) {
+// Observe the real monitor after its metadata lookup. Slow replica I/O can
+// cross a wall-clock scheduling boundary even when there is nothing to compact.
+func TestStoreCompactionMonitorSchedulesAfterWork(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		work time.Duration
-		next time.Duration
+		name  string
+		delay time.Duration
 	}{
-		{"before_boundary", 100 * time.Millisecond, 0},
-		{"cross_boundary", 300 * time.Millisecond, time.Minute},
-		{"cross_multiple_boundaries", 2*time.Minute + 300*time.Millisecond, 3 * time.Minute},
+		{"before_boundary", 10 * time.Millisecond},
+		{"cross_boundary", time.Second},
+		{"missed_boundaries", 95 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				boundary := time.Now().Truncate(time.Minute).Add(time.Minute)
-				time.Sleep(time.Until(boundary.Add(-200 * time.Millisecond)))
-				attempts := make(chan time.Time)
-				logger := slog.New(&compactionPassHandler{
-					Handler:  slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}),
-					work:     tc.work,
-					attempts: attempts,
-					first:    true,
-				})
-				// A ready metadata-only database with no new files exercises the
-				// actual monitor and CompactDB without starting unrelated workers.
-				db := &DB{opened: true, pageSize: 4096, Logger: logger}
-				db.maxLTXFileInfos.m = map[int]*ltx.FileInfo{0: {}, 1: {}}
-				level := &CompactionLevel{Level: 1, Interval: time.Minute}
-				store := &Store{dbs: []*DB{db}, levels: CompactionLevels{{Level: 0}, level}, Logger: logger}
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
+				// Start half a second before a minute, independently of the
+				// synthetic clock's initial wall time.
+				start := time.Now().Truncate(time.Minute).Add(2*time.Minute - 500*time.Millisecond)
+				time.Sleep(time.Until(start))
+				firstRead := true
+				client := &followTestReplicaClient{LTXFilesFunc: func(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+					if firstRead {
+						firstRead = false
+						time.Sleep(tc.delay)
+					}
+					return ltx.NewFileInfoSliceIterator(nil), nil
+				}}
+				db, observed := compactionScheduleDB(client)
+				ctx, cancel := context.WithCancel(t.Context())
+				store := NewStore([]*DB{db}, nil)
+				defer store.cancel()
+				db.SetLogger(slog.New(observed))
 				done := make(chan struct{})
 				go func() {
 					defer close(done)
-					store.monitorCompactionLevel(ctx, level)
+					store.monitorCompactionLevel(ctx, &CompactionLevel{Level: 3, Interval: time.Minute})
 				}()
-				<-attempts
-				got := <-attempts
+				first, second := <-observed.calls, <-observed.calls
 				cancel()
 				<-done
-				if want := boundary.Add(tc.next); !got.Equal(want) {
-					t.Fatalf("next pass at %s, want %s after %s of work", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano), tc.work)
+				if first.Before(start.Add(tc.delay)) {
+					t.Fatal("metadata delay was not exercised", first.Sub(start))
+				}
+				want := first.Truncate(time.Minute).Add(time.Minute)
+				if !second.Equal(want) {
+					t.Fatalf("next monitor pass at %s, want next wall-clock boundary %s after work completed at %s", second, want, first)
 				}
 			})
 		})
 	}
 }
+
+func TestStoreCompactionMonitorKeepsUnreadyRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		db, observed := compactionScheduleDB(&followTestReplicaClient{})
+		db.pageSize = 0
+		ctx, cancel := context.WithCancel(t.Context())
+		store := NewStore([]*DB{db}, nil)
+		defer store.cancel()
+		db.SetLogger(slog.New(observed))
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			store.monitorCompactionLevel(ctx, &CompactionLevel{Level: 3, Interval: time.Minute})
+		}()
+		first := <-observed.calls
+		db.mu.Lock()
+		db.pageSize = 4096
+		db.mu.Unlock()
+		second := <-observed.calls
+		cancel()
+		<-done
+		if got := second.Sub(first); got != time.Second {
+			t.Fatalf("unready database retry took %s, want 1s", got)
+		}
+	})
+}
+
+func compactionScheduleDB(client ReplicaClient) (*DB, *compactionScheduleObserver) {
+	db := NewDB("schedule.db")
+	// This fixture only exercises metadata admission; it has no SQLite file,
+	// background database monitor, or storage payload to close.
+	db.opened, db.pageSize = true, 4096
+	db.Replica = NewReplicaWithClient(db, client)
+	return db, &compactionScheduleObserver{calls: make(chan time.Time)}
+}
+
+type compactionScheduleObserver struct{ calls chan time.Time }
+
+func (*compactionScheduleObserver) Enabled(context.Context, slog.Level) bool { return true }
+func (h *compactionScheduleObserver) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "no compaction" || r.Message == "db not ready, skipping" {
+		h.calls <- r.Time
+	}
+	return nil
+}
+func (h *compactionScheduleObserver) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *compactionScheduleObserver) WithGroup(string) slog.Handler      { return h }

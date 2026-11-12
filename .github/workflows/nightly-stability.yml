@@ -93,21 +93,34 @@ jobs:
           echo "Selected duration: $(cat $GITHUB_OUTPUT | grep duration)"
 
       - name: Run LTX behavioral test (${{ matrix.profile }})
+        shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-artifacts"
           go test -tags 'integration,soak' \
             -run 'TestLTXBehavior$/${{ matrix.profile }}' \
             -v -timeout 170m \
-            ./tests/integration/
+            ./tests/integration/ 2>&1 | tee "$RUNNER_TEMP/nightly-artifacts/go-test.log"
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
+
+      - name: Prepare test summary and file manifest
+        if: always()
+        run: node .github/scripts/collect-nightly-artifacts.js /tmp litestream-ltx-behavior-
+        env:
+          NIGHTLY_JOB_STATUS: ${{ job.status }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ltx-behavioral-${{ matrix.profile }}
-          path: /tmp/litestream-ltx-behavior-*/
+          # Success keeps reports only; failures (including collection errors)
+          # and cancellations also retain the complete test directories.
+          path: |
+            ${{ runner.temp }}/nightly-artifacts/
+            ${{ job.status != 'success' && '/tmp/litestream-ltx-behavior-*/' || '' }}
+          include-hidden-files: true
           retention-days: 14
 
   ltx-snapshot-regression:
@@ -127,20 +140,31 @@ jobs:
           go build -o bin/litestream-test ./cmd/litestream-test
 
       - name: Run snapshot regression test
+        shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-artifacts"
           go test -tags 'integration,soak' \
             -run 'TestLTXBehavior_NoExcessiveSnapshots' \
             -v -timeout 20m \
-            ./tests/integration/
+            ./tests/integration/ 2>&1 | tee "$RUNNER_TEMP/nightly-artifacts/go-test.log"
         env:
           SOAK_KEEP_TEMP: "1"
+
+      - name: Prepare test summary and file manifest
+        if: always()
+        run: node .github/scripts/collect-nightly-artifacts.js /tmp litestream-ltx-behavior-
+        env:
+          NIGHTLY_JOB_STATUS: ${{ job.status }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ltx-snapshot-regression
-          path: /tmp/litestream-ltx-behavior-*/
+          path: |
+            ${{ runner.temp }}/nightly-artifacts/
+            ${{ job.status != 'success' && '/tmp/litestream-ltx-behavior-*/' || '' }}
+          include-hidden-files: true
           retention-days: 14
 
   minio-soak:
@@ -173,22 +197,33 @@ jobs:
           fi
 
       - name: Run MinIO soak test
+        shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-artifacts"
           go test -tags 'integration,soak,docker' \
             -run 'TestMinIOSoak' \
             -v -timeout 170m \
-            ./tests/integration/
+            ./tests/integration/ 2>&1 | tee "$RUNNER_TEMP/nightly-artifacts/go-test.log"
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_AUTO_PURGE: "yes"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
+
+      - name: Prepare test summary and file manifest
+        if: always()
+        run: node .github/scripts/collect-nightly-artifacts.js /tmp litestream-minio-soak-
+        env:
+          NIGHTLY_JOB_STATUS: ${{ job.status }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: minio-soak-results
-          path: /tmp/litestream-minio-soak-*/
+          path: |
+            ${{ runner.temp }}/nightly-artifacts/
+            ${{ job.status != 'success' && '/tmp/litestream-minio-soak-*/' || '' }}
+          include-hidden-files: true
           retention-days: 14
 
   replicate-restore-soak:
@@ -221,22 +256,33 @@ jobs:
           fi
 
       - name: Run replicate restore soak test
+        shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-artifacts"
           go test -tags 'integration,soak,docker' \
             -run 'TestSoakReplicateRestore' \
             -v -timeout 170m \
-            ./tests/integration/
+            ./tests/integration/ 2>&1 | tee "$RUNNER_TEMP/nightly-artifacts/go-test.log"
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_AUTO_PURGE: "yes"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
+
+      - name: Prepare test summary and file manifest
+        if: always()
+        run: node .github/scripts/collect-nightly-artifacts.js /tmp litestream-replicate-restore-
+        env:
+          NIGHTLY_JOB_STATUS: ${{ job.status }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: replicate-restore-soak-results
-          path: /tmp/litestream-replicate-restore-*/
+          path: |
+            ${{ runner.temp }}/nightly-artifacts/
+            ${{ job.status != 'success' && '/tmp/litestream-replicate-restore-*/' || '' }}
+          include-hidden-files: true
           retention-days: 14
 
   comprehensive-soak:
@@ -267,21 +313,32 @@ jobs:
           fi
 
       - name: Run comprehensive soak test
+        shell: bash
         run: |
+          mkdir -p "$RUNNER_TEMP/nightly-artifacts"
           go test -tags 'integration,soak' \
             -run 'TestComprehensiveSoak' \
             -v -timeout 170m \
-            ./tests/integration/
+            ./tests/integration/ 2>&1 | tee "$RUNNER_TEMP/nightly-artifacts/go-test.log"
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
+
+      - name: Prepare test summary and file manifest
+        if: always()
+        run: node .github/scripts/collect-nightly-artifacts.js /tmp litestream-comprehensive-soak-
+        env:
+          NIGHTLY_JOB_STATUS: ${{ job.status }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: comprehensive-soak-results
-          path: /tmp/litestream-comprehensive-soak-*/
+          path: |
+            ${{ runner.temp }}/nightly-artifacts/
+            ${{ job.status != 'success' && '/tmp/litestream-comprehensive-soak-*/' || '' }}
+          include-hidden-files: true
           retention-days: 14
 
   notify-on-failure:

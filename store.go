@@ -601,8 +601,6 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			// proceed
 		}
 
-		now := time.Now()
-
 		var notReadyDBs []string
 
 		for _, db := range s.DBs() {
@@ -627,10 +625,10 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			}
 		}
 
-		// A pass can cross the next wall-clock boundary while compacting or
-		// enforcing retention. Schedule from completion so a stale delay cannot
-		// trigger another pass in the same interval or drift by the work duration.
-		nextDelay := time.Until(lvl.NextCompactionAt(time.Now()))
+		// Compaction can cross one or more scheduling boundaries. Calculate
+		// the next delay after the work so it targets a future boundary.
+		now := time.Now()
+		nextDelay := lvl.NextCompactionAt(now).Sub(now)
 		timedOut := !retryDeadline.IsZero() && now.After(retryDeadline)
 		if len(notReadyDBs) > 0 && !timedOut {
 			if retryDeadline.IsZero() {

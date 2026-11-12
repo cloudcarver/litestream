@@ -66,6 +66,19 @@ Long-running soak tests live alongside the other integration tests and share the
 
 All soak tests support `go test -test.short` to scale the default duration down to roughly two minutes for smoke verification.
 
+### Nightly Artifacts
+
+Nightly stability jobs retain artifacts for 14 days. Successful jobs upload only
+`go-test.log` (including test reports and assertions), process `*.log` files,
+`summary.md`, and `files.jsonl` (original paths, byte sizes, and modification times,
+including hidden files). The summary is also shown in the Actions job summary.
+Database, WAL, restored database, and LTX payloads are omitted on success.
+
+Failed or cancelled jobs also attempt to upload their complete test temporary
+directories, including hidden Litestream state. Artifact collection errors fail
+the job and select the full-directory upload as well. `SOAK_KEEP_TEMP` still keeps
+the source files intact on the runner until job cleanup.
+
 ### Environment Variables
 
 | Variable | Default | Description |
