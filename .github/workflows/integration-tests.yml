@@ -95,6 +95,7 @@ jobs:
         run: |
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
+          echo "$PWD/bin" >> "$GITHUB_PATH"
 
       - name: Run quick integration tests
         run: |
@@ -127,6 +128,7 @@ jobs:
         run: |
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
+          echo "$PWD/bin" >> "$GITHUB_PATH"
 
       - name: Run all scenario tests
         run: |
@@ -160,6 +162,7 @@ jobs:
         run: |
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
+          echo "$PWD/bin" >> "$GITHUB_PATH"
 
       - name: Run long tests
         run: |
