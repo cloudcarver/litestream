@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -208,77 +209,45 @@ func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 }
 
 func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
-	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	mustAcquireSemaphore(db.execSem)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		err := db.lockExec(ctx)
-		done <- err
-		if err == nil {
-			db.execSem.Release(1)
-		}
-	}()
-
-	deadline := time.After(100 * time.Millisecond)
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if db.SyncDiagnostic().ExecutorWaiterCount == 1 {
-			break
-		}
-
-		select {
-		case err := <-done:
-			t.Fatalf("lockExec returned before reporting executor wait: %v", err)
-		case <-deadline:
-			t.Fatal("lockExec did not report executor wait")
-		case <-ticker.C:
-		}
-	}
-
-	hogReady := make(chan struct{})
-	hogAcquired := make(chan struct{})
-	hogDone := make(chan struct{})
-	go func() {
-		close(hogReady)
+	synctest.Test(t, func(t *testing.T) {
+		db := NewDB(filepath.Join(t.TempDir(), "db"))
 		mustAcquireSemaphore(db.execSem)
-		close(hogAcquired)
-		time.Sleep(150 * time.Millisecond)
-		db.execSem.Release(1)
-		close(hogDone)
-	}()
-	<-hogReady
-	time.Sleep(5 * time.Millisecond)
-
-	db.execSem.Release(1)
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("lockExec returned error: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		type acquisition struct {
+			name string
+			err  error
 		}
-	case <-hogAcquired:
-		// The hog legitimately acquires right after the queued waiter
-		// releases, so only fail if the waiter had not already succeeded.
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("lockExec returned error: %v", err)
+		order := make(chan acquisition, 2)
+		go func() {
+			err := db.lockExec(ctx)
+			order <- acquisition{"waiter", err}
+			if err == nil {
+				db.execSem.Release(1)
 			}
-		default:
-			<-hogDone
-			err := <-done
-			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}()
+		// The diagnostic starts before Acquire queues. Wait for the goroutine
+		// to block inside the semaphore, rather than inferring FIFO position
+		// from a counter or an elapsed wall-clock sleep on a loaded runner.
+		synctest.Wait()
+		if got := db.SyncDiagnostic().ExecutorWaiterCount; got != 1 {
+			db.execSem.Release(1)
+			t.Fatalf("waiter count=%d, want 1", got)
 		}
-	case <-ctx.Done():
-		err := <-done
-		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
-	}
+		go func() {
+			mustAcquireSemaphore(db.execSem)
+			order <- acquisition{name: "later"}
+			db.execSem.Release(1)
+		}()
+		synctest.Wait()
+		db.execSem.Release(1)
+		synctest.Wait()
+		for _, want := range []string{"waiter", "later"} {
+			if got := <-order; got.name != want || got.err != nil {
+				t.Fatalf("acquisition=%+v, want %s without error", got, want)
+			}
+		}
+	})
 }
 
 func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
@@ -313,75 +282,46 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 }
 
 func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
-	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
-	mustAcquireSemaphore(r.syncSem)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		err := r.lockSync(ctx)
-		done <- err
-		if err == nil {
-			r.syncSem.Release(1)
-		}
-	}()
-
-	// Wait until the waiter is observably queued so the hog cannot jump
-	// ahead of it in the semaphore FIFO.
-	waitDeadline := time.After(5 * time.Second)
-	waitTicker := time.NewTicker(time.Millisecond)
-	defer waitTicker.Stop()
-	for r.syncWaiters.Load() != 1 {
-		select {
-		case err := <-done:
-			t.Fatalf("lockSync returned before queueing on semaphore: %v", err)
-		case <-waitDeadline:
-			t.Fatal("lockSync did not report queued waiter")
-		case <-waitTicker.C:
-		}
-	}
-
-	hogReady := make(chan struct{})
-	hogAcquired := make(chan struct{})
-	hogDone := make(chan struct{})
-	go func() {
-		close(hogReady)
+	synctest.Test(t, func(t *testing.T) {
+		db := NewDB(filepath.Join(t.TempDir(), "db"))
+		r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
 		mustAcquireSemaphore(r.syncSem)
-		close(hogAcquired)
-		time.Sleep(150 * time.Millisecond)
-		r.syncSem.Release(1)
-		close(hogDone)
-	}()
-	<-hogReady
-	time.Sleep(5 * time.Millisecond)
-
-	r.syncSem.Release(1)
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("lockSync returned error: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		type acquisition struct {
+			name string
+			err  error
 		}
-	case <-hogAcquired:
-		// The hog legitimately acquires right after the queued waiter
-		// releases, so only fail if the waiter had not already succeeded.
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("lockSync returned error: %v", err)
+		order := make(chan acquisition, 2)
+		go func() {
+			err := r.lockSync(ctx)
+			order <- acquisition{"waiter", err}
+			if err == nil {
+				r.syncSem.Release(1)
 			}
-		default:
-			<-hogDone
-			err := <-done
-			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}()
+		// The diagnostic starts before Acquire queues. Wait for the goroutine
+		// to block inside the semaphore, rather than inferring FIFO position
+		// from a counter or an elapsed wall-clock sleep on a loaded runner.
+		synctest.Wait()
+		if got := r.syncWaiters.Load(); got != 1 {
+			r.syncSem.Release(1)
+			t.Fatalf("waiter count=%d, want 1", got)
 		}
-	case <-ctx.Done():
-		err := <-done
-		t.Fatalf("lockSync timed out waiting behind later lock attempt: %v", err)
-	}
+		go func() {
+			mustAcquireSemaphore(r.syncSem)
+			order <- acquisition{name: "later"}
+			r.syncSem.Release(1)
+		}()
+		synctest.Wait()
+		r.syncSem.Release(1)
+		synctest.Wait()
+		for _, want := range []string{"waiter", "later"} {
+			if got := <-order; got.name != want || got.err != nil {
+				t.Fatalf("acquisition=%+v, want %s without error", got, want)
+			}
+		}
+	})
 }
 
 func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
