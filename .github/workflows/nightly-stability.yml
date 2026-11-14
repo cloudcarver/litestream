@@ -11,7 +11,7 @@ on:
         default: '30m'
         type: string
       soak_runner:
-        description: 'Optional runner label with at least 128 GiB free for high-volume LTX soak'
+        description: 'High-volume runner: at least 96 GiB free for 30m, 384 GiB for longer/custom runs'
         required: false
         default: ''
         type: string
@@ -123,7 +123,7 @@ jobs:
           SOAK_KEEP_TEMP: "1"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
           TMPDIR: ${{ runner.temp }}/litestream-soak
-          NIGHTLY_MIN_FREE_GIB: ${{ matrix.profile == 'high-volume' && '128' || '12' }}
+          NIGHTLY_MIN_FREE_GIB: ${{ matrix.profile == 'high-volume' && (steps.config.outputs.duration == '30m' && '96' || '384') || '12' }}
 
       - name: Prepare test summary and file manifest
         if: always()
@@ -609,8 +609,9 @@ jobs:
               }
 
               let annotations = [];
-              const rawJob = jobs.find(item => item.id === job.id);
-              const checkRun = rawJob?.check_run_url?.match(/\/check-runs\/(\d+)$/);
+              const rawJob = job.classificationError ? null : jobs.find(item => item?.id === job.id);
+              const checkURL = rawJob?.check_run_url;
+              const checkRun = typeof checkURL === 'string' ? checkURL.match(/\/check-runs\/(\d+)$/) : null;
               if (checkRun) {
                 try {
                   annotations = await github.paginate(github.rest.checks.listAnnotations, {

@@ -186,11 +186,13 @@ test('downloads failure logs when a later step has a null conclusion', async () 
 
 test('creates a tracking issue for malformed job objects', async () => {
   const jobs = [
+    null,
     {
       id: 1,
       name: 'Race Detector Sweep',
       conclusion: 'failure',
       steps: {},
+      check_run_url: { invalid: true },
     },
     {
       id: 2,

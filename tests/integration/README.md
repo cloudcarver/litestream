@@ -74,6 +74,9 @@ Set the repository variable `LITESTREAM_SOAK_RUNNER`, or the manual workflow inp
 `soak_runner`, to a runner that meets the workflow's `NIGHTLY_MIN_FREE_GIB`
 requirement after building the binaries. Hosted runners reclaim unused SDKs;
 the workflow never removes SDKs from a self-hosted machine.
+The high-volume budget is 96 GiB for the standard 30-minute run and 384 GiB for
+longer or custom durations. The observed two-hour profile can retain over
+150 GiB before completing; its database size alone is not a useful disk budget.
 
 LTX behavioral jobs keep their test directories under the job's
 `$RUNNER_TEMP/litestream-soak`. The test supervisor records disk and memory samples
