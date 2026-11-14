@@ -386,7 +386,7 @@ jobs:
             const { classifyJobs } = require(
               `${process.env.GITHUB_WORKSPACE}/.github/scripts/nightly-stability-jobs`
             );
-            const { extractRace, extractTestFailure, extractInfrastructureFailure } = require(
+            const { extractRace, extractTestFailure, extractInfrastructureFailure, extractResourceFailure } = require(
               `${process.env.GITHUB_WORKSPACE}/.github/scripts/nightly-stability-logs`
             );
 
@@ -624,7 +624,7 @@ jobs:
                 }
               }
 
-              const evidence = extractRace(logText) || extractTestFailure(logText) || extractInfrastructureFailure(annotations);
+              const evidence = extractResourceFailure(logText) || extractRace(logText) || extractTestFailure(logText) || extractInfrastructureFailure(annotations);
               const snippets = evidence
                 ? evidence.snippets.map(line => sanitizeSnippet(line, 260))
                 : extractFailureSnippets(logText);

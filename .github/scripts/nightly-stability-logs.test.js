@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { extractRace, extractTestFailure, extractInfrastructureFailure } = require('./nightly-stability-logs');
+const { extractRace, extractTestFailure, extractInfrastructureFailure, extractResourceFailure } = require('./nightly-stability-logs');
 
 const race = [
   '==================',
@@ -70,4 +70,17 @@ test('recovers disk exhaustion from check annotations when job logs are unavaila
   assert.equal(result.signature, 'runner disk exhausted');
   assert.match(result.snippets[0], /No space left on device/);
   assert.equal(extractInfrastructureFailure([{ annotation_level: 'notice', message: 'No space left on device' }]), null);
+});
+
+test('extracts resource refusal and interruption before generic process-exit errors', () => {
+  for (const message of [
+    'Insufficient runner disk: need 384.0 GiB free, have 20.0 GiB.',
+    'Runner disk reserve exhausted: 100 bytes free, 200 required. Stopping the test to preserve failure diagnostics.',
+    'Runner resource sampling failed: statfs unavailable',
+  ]) {
+    const result = extractResourceFailure('2026-11-14T06:43:47.123Z ' + message + '\nProcess completed with exit code 1.');
+    assert.equal(result.signature, message.slice(0, message.indexOf(':')).toLowerCase());
+    assert.deepEqual(result.snippets, [message]);
+  }
+  assert.equal(extractResourceFailure('    helpers_test.go:10: expected Insufficient runner disk\n--- PASS: TestGuard'), null);
 });

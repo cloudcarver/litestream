@@ -59,4 +59,10 @@ function extractInfrastructureFailure(annotations) {
   return { signature: disk ? 'runner disk exhausted' : snippets[0], snippets };
 }
 
-module.exports = { extractRace, extractTestFailure, extractInfrastructureFailure };
+function extractResourceFailure(logText) {
+  const line = logLines(logText).find(value => /^(?:Insufficient runner disk|Runner disk reserve exhausted|Runner resource sampling failed):/u.test(value));
+  if (!line) return null;
+  return { signature: line.slice(0, line.indexOf(':')).toLowerCase(), snippets: [line] };
+}
+
+module.exports = { extractRace, extractTestFailure, extractInfrastructureFailure, extractResourceFailure };
