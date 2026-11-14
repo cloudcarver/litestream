@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { extractRace } = require('./nightly-stability-logs');
+const { extractRace, extractTestFailure, extractInfrastructureFailure, extractResourceFailure } = require('./nightly-stability-logs');
 
 const race = [
   '==================',
@@ -42,4 +42,45 @@ test('retains a truncated race report without inventing missing frames', () => {
   const result = extractRace('WARNING: DATA RACE\nWrite at 0x12 by goroutine 1:');
   assert.equal(result.signature, 'data race');
   assert.equal(result.snippets.length, 2);
+});
+
+test('retains the failed Go test assertion despite later successful cleanup logs', () => {
+  const result = extractTestFailure([
+    '2026-11-13T18:10:00.000Z === RUN   TestDB_LockExecDoesNotStarveQueuedWaiter',
+    '2026-11-13T18:10:00.001Z     db_internal_test.go:271: later lock acquired before queued waiter; err=context deadline exceeded',
+    '2026-11-13T18:10:00.002Z --- FAIL: TestDB_LockExecDoesNotStarveQueuedWaiter (0.16s)',
+    '2026-11-13T18:10:01.000Z === RUN   TestRestore_MultipleSyncs',
+    '2026-11-13T18:10:02.000Z level=DEBUG msg="db close" error=<nil>',
+    '2026-11-13T18:10:02.001Z --- PASS: TestRestore_MultipleSyncs (1.00s)',
+  ].join('\n'));
+  assert.match(result.signature, /TestDB_LockExecDoesNotStarveQueuedWaiter/);
+  assert.ok(result.snippets.some(line => line.includes('later lock acquired before queued waiter')));
+  assert.ok(result.snippets.every(line => !line.includes('<nil>')));
+});
+
+test('does not invent a Go failure from a successful test or nil error', () => {
+  assert.equal(extractTestFailure('=== RUN   TestOK\nerror=<nil>\n--- PASS: TestOK (0.1s)'), null);
+});
+
+test('recovers disk exhaustion from check annotations when job logs are unavailable', () => {
+  const result = extractInfrastructureFailure([
+    { annotation_level: 'notice', message: 'ubuntu-latest will migrate' },
+    { annotation_level: 'failure', message: "System.IO.IOException: No space left on device : '/home/runner/actions-runner/_diag/Worker.log'\n at StreamWriter.Flush()" },
+  ]);
+  assert.equal(result.signature, 'runner disk exhausted');
+  assert.match(result.snippets[0], /No space left on device/);
+  assert.equal(extractInfrastructureFailure([{ annotation_level: 'notice', message: 'No space left on device' }]), null);
+});
+
+test('extracts resource refusal and interruption before generic process-exit errors', () => {
+  for (const message of [
+    'Insufficient runner disk: need 384.0 GiB free, have 20.0 GiB.',
+    'Runner disk reserve exhausted: 100 bytes free, 200 required. Stopping the test to preserve failure diagnostics.',
+    'Runner resource sampling failed: statfs unavailable',
+  ]) {
+    const result = extractResourceFailure('2026-11-14T06:43:47.123Z ' + message + '\nProcess completed with exit code 1.');
+    assert.equal(result.signature, message.slice(0, message.indexOf(':')).toLowerCase());
+    assert.deepEqual(result.snippets, [message]);
+  }
+  assert.equal(extractResourceFailure('    helpers_test.go:10: expected Insufficient runner disk\n--- PASS: TestGuard'), null);
 });

@@ -48,7 +48,7 @@ function classifyJobs(jobs) {
       name: job.name,
       url: job.html_url || job.url || '',
       failedSteps: job.steps
-        .filter(step => step.conclusion === 'failure')
+        .filter(step => step.conclusion === 'failure' || step.status === 'in_progress')
         .map(step => step.name),
       classificationError: '',
     });

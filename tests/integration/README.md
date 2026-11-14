@@ -68,6 +68,25 @@ All soak tests support `go test -test.short` to scale the default duration down 
 
 ### Nightly Artifacts
 
+The high-volume LTX profile needs substantially more disk than its final database:
+checkpoint boundary snapshots and multiple LTX levels coexist during the run.
+Set the repository variable `LITESTREAM_SOAK_RUNNER`, or the manual workflow input
+`soak_runner`, to a runner that meets the workflow's `NIGHTLY_MIN_FREE_GIB`
+requirement after building the binaries. Hosted runners reclaim unused SDKs;
+the workflow never removes SDKs from a self-hosted machine.
+The high-volume budget is 96 GiB for the standard 30-minute run and 384 GiB for
+longer or custom durations. The observed two-hour profile can retain over
+150 GiB before completing; its database size alone is not a useful disk budget.
+
+LTX behavioral jobs keep their test directories under the job's
+`$RUNNER_TEMP/litestream-soak`. The test supervisor records disk and memory samples
+in `resources.jsonl` every ten seconds and stops its test process group if less
+than 8 GiB remains, preserving room for diagnostics. This is a failed run even if
+the interrupted test returns zero. Resource sampling errors also fail the run.
+The workload, assertions, and test deadline are unchanged. Sudden runner loss can
+still prevent post-test steps from running; check-run annotations are retained by
+GitHub independently of the runner's logs.
+
 Nightly stability jobs retain artifacts for 14 days. Successful jobs upload only
 `go-test.log` (including test reports and assertions), process `*.log` files,
 `summary.md`, and `files.jsonl` (original paths, byte sizes, and modification times,
@@ -78,6 +97,14 @@ Failed or cancelled jobs also attempt to upload their complete test temporary
 directories, including hidden Litestream state. Artifact collection errors fail
 the job and select the full-directory upload as well. `SOAK_KEEP_TEMP` still keeps
 the source files intact on the runner until job cleanup.
+
+LTX behavioral jobs upload the small diagnostic artifact first. Failed test data
+is a separate `ltx-behavioral-<profile>-payload` artifact, so a large payload upload
+failure does not discard already-uploaded logs, resource samples and summaries.
+
+Run `node --test .github/scripts/*.test.js` to verify the supervisor and notifier,
+including exhausted-disk interruption, preserved failure exit codes, missing job
+logs and failure-annotation fallback.
 
 ### Environment Variables
 
