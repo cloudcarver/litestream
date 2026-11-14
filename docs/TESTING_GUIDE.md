@@ -293,6 +293,14 @@ creation fails (including HTTP 410 on forks with Issues disabled), the notifier
 still fails visibly, and its summary and the race artifact remain available.
 No external notification channel is configured by this fallback.
 
+The notifier also identifies failed Go tests and preserves their assertion lines
+before considering generic runtime error logs. Successful cleanup messages such
+as `error=<nil>` are not failure causes. It reads failed check-run annotations
+with `checks: read`; these can identify runner disk exhaustion even when the job
+log endpoint returns 404. If a runner dies during a step, the summary identifies
+that interrupted step. See [nightly artifacts](../tests/integration/README.md#nightly-artifacts)
+for disk preflight, resource sampling and separate diagnostic/payload uploads.
+
 ### Common Race Conditions
 
 #### 1. Position Updates

@@ -79,7 +79,7 @@ test('retains failed steps when another step has no conclusion', () => {
   assert.deepEqual(failures[0].failedSteps, ['Run LTX behavioral test']);
 });
 
-test('reports cancelled jobs whose steps have no conclusion', () => {
+test('reports the interrupted step when a cancelled job has no step conclusion', () => {
   const failures = classifyJobs([
     {
       id: 1,
@@ -91,7 +91,7 @@ test('reports cancelled jobs whose steps have no conclusion', () => {
 
   assert.equal(failures.length, 1);
   assert.equal(failures[0].classificationError, '');
-  assert.deepEqual(failures[0].failedSteps, []);
+  assert.deepEqual(failures[0].failedSteps, ['Run MinIO soak test']);
 });
 
 test('continues to reject missing or invalid step conclusions', () => {
@@ -271,6 +271,63 @@ async function runNotifierScript({ context, github, core, fetch }) {
   const execute = new AsyncFunction('require', 'context', 'github', 'core', 'fetch', scriptLines.join('\n'));
   await execute(require, context, github, core, fetch);
 }
+
+test('notifier reports exhausted runner disk and failed assertions instead of 404 and nil errors', async () => {
+  const prior = process.env.GITHUB_WORKSPACE;
+  process.env.GITHUB_WORKSPACE = process.cwd();
+  const created = [];
+  const failures = [];
+  const listAnnotations = () => {};
+  const jobs = [
+    { id: 11, name: 'LTX Behavioral Soak (high-volume)', conclusion: 'failure',
+      check_run_url: 'https://api.github.com/repos/cloudcarver/litestream/check-runs/11',
+      steps: [{ name: 'Run LTX behavioral test (high-volume)', status: 'in_progress', conclusion: null }] },
+    { id: 12, name: 'Race Detector Sweep', conclusion: 'failure',
+      steps: [{ name: 'Run tests with race detector (3x)', conclusion: 'failure' }] },
+  ];
+  try {
+    await runNotifierScript({
+      context: { repo: { owner: 'cloudcarver', repo: 'litestream' }, runId: 43479600026,
+        serverUrl: 'https://github.com', ref: 'refs/heads/main', sha: 'd10c0600438def19' },
+      github: {
+        paginate: async route => {
+          if (typeof route === 'string') return jobs;
+          if (route === listAnnotations) return [{ annotation_level: 'failure', message: 'System.IO.IOException: No space left on device' }];
+          return [];
+        },
+        rest: { checks: { listAnnotations }, issues: {
+          listForRepo: () => {},
+          create: async input => {
+            created.push(input);
+            return { data: { number: 3, html_url: 'https://github.com/cloudcarver/litestream/issues/3' } };
+          },
+        } },
+      },
+      core: { setFailed: message => failures.push(message) },
+      fetch: async url => url.includes('/11/') ? { ok: false, status: 404 } : {
+        ok: true,
+        text: async () => [
+          '=== RUN   TestDB_LockExecDoesNotStarveQueuedWaiter',
+          '    db_internal_test.go:271: later lock acquired before queued waiter; err=context deadline exceeded',
+          '--- FAIL: TestDB_LockExecDoesNotStarveQueuedWaiter (0.16s)',
+          '=== RUN   TestRestore_MultipleSyncs',
+          'level=DEBUG msg="db close" error=<nil>',
+          '--- PASS: TestRestore_MultipleSyncs (1.00s)',
+        ].join('\n'),
+      },
+    });
+  } finally {
+    if (prior === undefined) delete process.env.GITHUB_WORKSPACE;
+    else process.env.GITHUB_WORKSPACE = prior;
+  }
+  assert.deepEqual(failures, []);
+  assert.equal(created.length, 1);
+  assert.match(created[0].title, /runner disk exhausted/);
+  assert.match(created[0].body, /No space left on device/);
+  assert.match(created[0].body, /later lock acquired before queued waiter/);
+  assert.match(created[0].body, /Run LTX behavioral test \(high-volume\)/);
+  assert.doesNotMatch(created[0].title, /<nil>|404/);
+});
 
 for (const failureStage of ['list', 'create', 'none']) {
   test(`preserves race evidence when Issues ${failureStage === 'none' ? 'succeeds' : failureStage + ' fails'}`, async () => {
