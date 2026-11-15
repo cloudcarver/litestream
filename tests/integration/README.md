@@ -221,18 +221,13 @@ Edge case and boundary condition tests:
 - `Test1GBBoundary` - SQLite 1GB lock page boundary (page #262145 with 4KB pages)
 - `TestLockPageWithDifferentPageSizes` - Lock page handling with various page sizes
 
-## CI Integration
+## Manual verification workflows
 
-### Automatic (Pull Requests)
-
-Quick tests run automatically on PRs modifying Go code:
-
-```yaml
-- Quick integration tests (TestFreshStart, TestDatabaseIntegrity, TestRapidCheckpoints)
-- Timeout: 30 minutes
-```
-
-### Manual Workflows
+This fork runs verification only on explicit dispatch. Commit, Integration,
+Upgrade and Stability workflows have no pull-request, push or schedule triggers;
+the automatic PR Build Metrics workflow is removed. Release and Docker publishing,
+the dedicated Manual Integration Tests and Pre-Release Checklist keep their
+existing triggers. Local test commands are unchanged.
 
 Trigger via GitHub Actions UI:
 
@@ -489,7 +484,7 @@ Metrics reported during execution:
 2. **Better Debugging** - Use standard Go debugging tools
 3. **Code Reuse** - Shared helpers and fixtures
 4. **Parallel Execution** - Tests can run concurrently
-5. **CI Integration** - Run automatically on PRs
+5. **Manual Verification** - Run explicitly before release
 6. **Test Coverage** - Measure code coverage
 7. **Consistent Patterns** - Standard Go testing conventions
 8. **Better Error Messages** - Structured, clear reporting
@@ -506,7 +501,7 @@ When adding new integration tests:
 4. Call `defer db.Cleanup()` for automatic cleanup
 5. Log test progress with descriptive messages
 6. Use `GetTestDuration(t, default)` for configurable durations
-7. Add test to CI workflow if appropriate
+7. Add test to a manual verification workflow if appropriate
 8. Update this README with new test documentation
 
 ## Related Documentation

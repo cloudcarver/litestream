@@ -1,8 +1,5 @@
 name: Nightly Stability
 on:
-  schedule:
-    - cron: '0 3 * * 1-5'   # Weekdays at 3 AM UTC (30m per profile)
-    - cron: '0 3 * * 6'     # Saturdays at 3 AM UTC (2h per profile)
   workflow_dispatch:
     inputs:
       duration:
