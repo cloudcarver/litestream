@@ -16,11 +16,18 @@ const commitWorkflow = fs.readFileSync(
   'utf8'
 );
 
-test('runs the integration workflow for every pull request', () => {
-  const pullRequestTrigger = workflow.match(/  pull_request:\n([\s\S]*?)  workflow_dispatch:/);
+for (const name of ['commit', 'integration-tests', 'nightly-stability', 'upgrade-tests']) {
+  test(`${name} verification starts only by manual dispatch`, () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'workflows', `${name}.yml`), 'utf8');
+    const triggers = source.match(/^on:\n((?:[ \t].*\n|\n)*)/m);
 
-  assert.ok(pullRequestTrigger);
-  assert.doesNotMatch(pullRequestTrigger[1], /^    paths:/m);
+    assert.ok(triggers, `${name} must declare its manual entry point`);
+    assert.deepEqual([...triggers[1].matchAll(/^  ([\w]+):/gm)].map(match => match[1]),
+      ['workflow_dispatch'], `${name} must not restore automatic test triggers`);
+  });
+}
+
+test('manual integration dispatch retains the test type selection', () => {
   assert.match(workflow, /  workflow_dispatch:\n    inputs:\n      test_type:/);
 });
 
