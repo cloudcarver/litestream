@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/benbjohnson/litestream/internal"
 )
+
+const compactionBufferSize = 64 * 1024
 
 // Compactor handles compaction and retention for LTX files.
 // It operates solely through the ReplicaClient interface, making it
@@ -161,13 +164,27 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 
 	pr, pw := io.Pipe()
 	go func() {
-		comp, err := ltx.NewCompactor(pw, rdrs)
+		// LTX emits several small writes per page and page-index entry.
+		// Batch both sides of the stream to avoid a syscall or pipe handoff
+		// for each field. Keep the original readers owned by the defer above.
+		bufferedReaders := make([]io.Reader, len(rdrs))
+		for i, rd := range rdrs {
+			bufferedReaders[i] = bufio.NewReaderSize(rd, compactionBufferSize)
+		}
+		writer := bufio.NewWriterSize(pw, compactionBufferSize)
+		comp, err := ltx.NewCompactor(writer, bufferedReaders)
 		if err != nil {
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(comp.Compact(ctx))
+		if err := comp.Compact(ctx); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		// Flush failures must reach the replica writer; EOF is only valid
+		// after the final partial buffer has been delivered successfully.
+		_ = pw.CloseWithError(writer.Flush())
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
